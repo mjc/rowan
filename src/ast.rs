@@ -60,6 +60,11 @@ impl<L: Language> SyntaxNodePtr<L> {
         Self { kind: node.kind(), range: node.text_range() }
     }
 
+    /// Creates a pointer from a kind and range already known to identify a syntax node.
+    pub fn from_kind_and_range(kind: L::Kind, range: TextRange) -> Self {
+        Self { kind, range }
+    }
+
     /// Like [`Self::try_to_node`] but panics instead of returning `None` on
     /// failure.
     pub fn to_node(&self, root: &SyntaxNode<L>) -> SyntaxNode<L> {
@@ -206,5 +211,34 @@ pub mod support {
 
     pub fn token<L: Language>(parent: &SyntaxNode<L>, kind: L::Kind) -> Option<SyntaxToken<L>> {
         parent.children_with_tokens().filter_map(|it| it.into_token()).find(|it| it.kind() == kind)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{ast::SyntaxNodePtr, Language, SyntaxKind, TextRange, TextSize};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    enum TestLanguage {}
+
+    impl Language for TestLanguage {
+        type Kind = SyntaxKind;
+
+        fn kind_from_raw(raw: SyntaxKind) -> Self::Kind {
+            raw
+        }
+
+        fn kind_to_raw(kind: Self::Kind) -> SyntaxKind {
+            kind
+        }
+    }
+
+    #[test]
+    fn syntax_node_ptr_from_known_kind_and_range() {
+        let range = TextRange::new(TextSize::from(3), TextSize::from(8));
+        let ptr = SyntaxNodePtr::<TestLanguage>::from_kind_and_range(SyntaxKind(7), range);
+
+        assert_eq!(ptr.kind(), SyntaxKind(7));
+        assert_eq!(ptr.text_range(), range);
     }
 }
