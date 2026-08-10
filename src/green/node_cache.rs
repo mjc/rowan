@@ -48,7 +48,7 @@ fn token_hash(token: &GreenTokenData) -> u64 {
     let mut h = FxHasher::default();
     token.kind().hash(&mut h);
     token.text().hash(&mut h);
-    h.finish()
+    h.finish() & !STATIC_TOKEN_HASH_BIT
 }
 
 fn node_hash(node: &GreenNodeData) -> u64 {
