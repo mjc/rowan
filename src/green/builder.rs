@@ -1,6 +1,6 @@
 use crate::{
     cow_mut::CowMut,
-    green::{node_cache::NodeCache, GreenElement, GreenNode, SyntaxKind},
+    green::{node_cache::NodeCache, GreenElement, GreenNode, GreenToken, SyntaxKind},
     NodeOrToken,
 };
 
@@ -36,6 +36,13 @@ impl GreenNodeBuilder<'_> {
     #[inline]
     pub fn token(&mut self, kind: SyntaxKind, text: &str) {
         let (hash, token) = self.cache.token(kind, text);
+        self.children.push((hash, token.into()));
+    }
+
+    /// Adds an existing green token to the current branch.
+    #[inline]
+    pub fn token_from_green(&mut self, token: GreenToken) {
+        let (hash, token) = self.cache.token_from_green(token);
         self.children.push((hash, token.into()));
     }
 

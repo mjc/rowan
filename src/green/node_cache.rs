@@ -154,4 +154,8 @@ impl NodeCache {
 
         (hash, token)
     }
+
+    pub(crate) fn token_from_green(&mut self, token: GreenToken) -> (u64, GreenToken) {
+        (token_hash(&token), token)
+    }
 }
