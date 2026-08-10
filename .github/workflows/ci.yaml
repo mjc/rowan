@@ -2,7 +2,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: ["master", "staging", "trying"]
+    branches: ["master", "staging", "trying", "mjc/static-token-sharing"]
 
 env:
   CARGO_INCREMENTAL: 0
@@ -18,14 +18,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
       with:
         fetch-depth: 0 # fetch tags for publish
-    - uses: actions-rs/toolchain@v1
+    - uses: dtolnay/rust-toolchain@stable
       with:
-        toolchain: stable
-        profile: minimal
-        override: true
+        components: clippy, rustfmt
 
     - run: cargo run -p xtask -- ci
       env:
