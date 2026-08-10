@@ -1,5 +1,3 @@
-use std::sync::OnceLock;
-
 use crate::{
     cow_mut::CowMut,
     green::{node_cache::NodeCache, GreenElement, GreenNode, GreenToken, SyntaxKind},
@@ -16,7 +14,6 @@ pub struct GreenNodeBuilder<'cache> {
     cache: CowMut<'cache, NodeCache>,
     parents: Vec<(SyntaxKind, usize)>,
     children: Vec<(u64, GreenElement)>,
-    static_leaf_nodes: Option<&'static [OnceLock<GreenNode>]>,
 }
 
 impl GreenNodeBuilder<'_> {
@@ -32,19 +29,6 @@ impl GreenNodeBuilder<'_> {
             cache: CowMut::Borrowed(cache),
             parents: Vec::new(),
             children: Vec::new(),
-            static_leaf_nodes: None,
-        }
-    }
-
-    /// Reuses a fixed set of one-token nodes across builders.
-    pub fn with_static_leaf_nodes(
-        static_leaf_nodes: &'static [OnceLock<GreenNode>],
-    ) -> GreenNodeBuilder<'static> {
-        GreenNodeBuilder {
-            cache: CowMut::Owned(NodeCache::default()),
-            parents: Vec::new(),
-            children: Vec::new(),
-            static_leaf_nodes: Some(static_leaf_nodes),
         }
     }
 
@@ -62,13 +46,6 @@ impl GreenNodeBuilder<'_> {
         self.children.push((hash, token.into()));
     }
 
-    /// Adds an existing token that may be the only child of a shared static leaf node.
-    #[inline]
-    pub fn token_from_static_green(&mut self, token: GreenToken) {
-        let (hash, token) = self.cache.token_from_green(token);
-        self.children.push((hash | super::node_cache::STATIC_TOKEN_HASH_BIT, token.into()));
-    }
-
     /// Start new node and make it current.
     #[inline]
     pub fn start_node(&mut self, kind: SyntaxKind) {
@@ -81,8 +58,7 @@ impl GreenNodeBuilder<'_> {
     #[inline]
     pub fn finish_node(&mut self) {
         let (kind, first_child) = self.parents.pop().unwrap();
-        let (hash, node) =
-            self.cache.node(kind, &mut self.children, first_child, self.static_leaf_nodes);
+        let (hash, node) = self.cache.node(kind, &mut self.children, first_child);
         self.children.push((hash, node.into()));
     }
 

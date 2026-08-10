@@ -1,9 +1,6 @@
 use hashbrown::hash_map::RawEntryMut;
 use rustc_hash::FxHasher;
-use std::{
-    hash::{BuildHasherDefault, Hash, Hasher},
-    sync::OnceLock,
-};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 
 use crate::{
     green::GreenElementRef, GreenNode, GreenNodeData, GreenToken, GreenTokenData, NodeOrToken,
@@ -13,8 +10,6 @@ use crate::{
 use super::element::GreenElement;
 
 type HashMap<K, V> = hashbrown::HashMap<K, V, BuildHasherDefault<FxHasher>>;
-
-pub(crate) const STATIC_TOKEN_HASH_BIT: u64 = 1 << 63;
 
 #[derive(Debug)]
 struct NoHash<T>(T);
@@ -77,7 +72,6 @@ impl NodeCache {
         kind: SyntaxKind,
         children: &mut Vec<(u64, GreenElement)>,
         first_child: usize,
-        static_leaf_nodes: Option<&'static [OnceLock<GreenNode>]>,
     ) -> (u64, GreenNode) {
         let build_node = move |children: &mut Vec<(u64, GreenElement)>| {
             GreenNode::new(kind, children.drain(first_child..).map(|(_, it)| it))
@@ -101,29 +95,6 @@ impl NodeCache {
             }
             h.finish()
         };
-
-        if children_ref.len() == 1 && children_ref[0].0 & STATIC_TOKEN_HASH_BIT != 0 {
-            if let Some(static_leaf) = static_leaf_nodes
-                .and_then(|static_leaf_nodes| static_leaf_nodes.get(kind.0 as usize))
-            {
-                if let Some(node) = static_leaf.get() {
-                    if node.kind() == kind
-                        && node.children().len() == 1
-                        && element_id(node.children().next().unwrap())
-                            == element_id(children_ref[0].1.as_deref())
-                    {
-                        drop(children.drain(first_child..));
-                        return (hash, node.clone());
-                    }
-                }
-
-                let node = build_node(children);
-                return match static_leaf.set(node) {
-                    Ok(()) => (hash, static_leaf.get().unwrap().clone()),
-                    Err(node) => (hash, node),
-                };
-            }
-        }
 
         // Green nodes are fully immutable, so it's ok to deduplicate them.
         // This is the same optimization that Roslyn does
