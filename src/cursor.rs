@@ -381,6 +381,39 @@ impl SyntaxNode {
         SyntaxElementChildren::new(self.clone())
     }
 
+    #[inline]
+    pub(crate) fn child_by_kind(
+        &self,
+        mut predicate: impl FnMut(SyntaxKind) -> bool,
+    ) -> Option<SyntaxNode> {
+        self.green_ref().children().raw.enumerate().find_map(|(index, child)| {
+            let green = child.as_ref().into_node()?;
+            predicate(green.kind()).then(|| {
+                SyntaxNode::new_child(
+                    green,
+                    self.clone(),
+                    index as u32,
+                    self.offset() + child.rel_offset(),
+                )
+            })
+        })
+    }
+
+    #[inline]
+    pub(crate) fn token_by_kind(&self, kind: SyntaxKind) -> Option<SyntaxToken> {
+        self.green_ref().children().raw.enumerate().find_map(|(index, child)| {
+            let green = child.as_ref().into_token()?;
+            (green.kind() == kind).then(|| {
+                SyntaxToken::new(
+                    green,
+                    self.clone(),
+                    index as u32,
+                    self.offset() + child.rel_offset(),
+                )
+            })
+        })
+    }
+
     pub fn first_child(&self) -> Option<SyntaxNode> {
         self.green_ref().children().raw.enumerate().find_map(|(index, child)| {
             child.as_ref().into_node().map(|green| {

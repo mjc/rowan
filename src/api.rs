@@ -145,6 +145,21 @@ impl<L: Language> SyntaxNode<L> {
         SyntaxElementChildren { raw: self.raw.children_with_tokens(), _p: PhantomData }
     }
 
+    /// Returns the first direct node child whose kind matches `predicate`.
+    #[inline]
+    pub fn child_by_kind(
+        &self,
+        mut predicate: impl FnMut(L::Kind) -> bool,
+    ) -> Option<SyntaxNode<L>> {
+        self.raw.child_by_kind(|kind| predicate(L::kind_from_raw(kind))).map(SyntaxNode::from)
+    }
+
+    /// Returns the first direct token child with `kind`.
+    #[inline]
+    pub fn token_by_kind(&self, kind: L::Kind) -> Option<SyntaxToken<L>> {
+        self.raw.token_by_kind(L::kind_to_raw(kind)).map(SyntaxToken::from)
+    }
+
     pub fn first_child(&self) -> Option<SyntaxNode<L>> {
         self.raw.first_child().map(Self::from)
     }
@@ -477,5 +492,49 @@ impl<L: Language> From<SyntaxElement<L>> for cursor::SyntaxElement {
             NodeOrToken::Node(it) => NodeOrToken::Node(it.into()),
             NodeOrToken::Token(it) => NodeOrToken::Token(it.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{GreenNodeBuilder, Language, SyntaxKind};
+
+    use super::SyntaxNode;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    enum TestLanguage {}
+
+    impl Language for TestLanguage {
+        type Kind = SyntaxKind;
+
+        fn kind_from_raw(raw: SyntaxKind) -> Self::Kind {
+            raw
+        }
+
+        fn kind_to_raw(kind: Self::Kind) -> SyntaxKind {
+            kind
+        }
+    }
+
+    #[test]
+    fn direct_kind_lookups_skip_non_matching_children() {
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(SyntaxKind(0));
+        builder.start_node(SyntaxKind(1));
+        builder.token(SyntaxKind(2), "first");
+        builder.finish_node();
+        builder.token(SyntaxKind(3), "middle");
+        builder.start_node(SyntaxKind(4));
+        builder.token(SyntaxKind(5), "second");
+        builder.finish_node();
+        builder.finish_node();
+        let root = SyntaxNode::<TestLanguage>::new_root(builder.finish());
+
+        let found = (
+            root.child_by_kind(|kind| kind == SyntaxKind(4)).unwrap().kind(),
+            root.token_by_kind(SyntaxKind(3)).unwrap().text().to_string(),
+        );
+
+        assert_eq!(found, (SyntaxKind(4), "middle".to_string()));
     }
 }
