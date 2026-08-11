@@ -377,14 +377,6 @@ impl SyntaxNode {
     }
 
     #[inline]
-    pub(crate) fn children_by_kind(
-        &self,
-        predicate: fn(SyntaxKind) -> bool,
-    ) -> SyntaxNodeChildrenByKind {
-        SyntaxNodeChildrenByKind { parent: self.clone(), next_index: 0, predicate }
-    }
-
-    #[inline]
     pub fn children_with_tokens(&self) -> SyntaxElementChildren {
         SyntaxElementChildren::new(self.clone())
     }
@@ -891,32 +883,25 @@ impl From<SyntaxToken> for SyntaxElement {
 
 #[derive(Clone, Debug)]
 pub struct SyntaxNodeChildren {
-    next: Option<SyntaxNode>,
+    parent: SyntaxNode,
+    next_index: usize,
 }
 
 impl SyntaxNodeChildren {
     fn new(parent: SyntaxNode) -> SyntaxNodeChildren {
-        SyntaxNodeChildren { next: parent.first_child() }
+        SyntaxNodeChildren { parent, next_index: 0 }
     }
-}
 
-#[derive(Clone, Debug)]
-pub struct SyntaxNodeChildrenByKind {
-    parent: SyntaxNode,
-    next_index: usize,
-    predicate: fn(SyntaxKind) -> bool,
-}
-
-impl Iterator for SyntaxNodeChildrenByKind {
-    type Item = SyntaxNode;
-
-    fn next(&mut self) -> Option<SyntaxNode> {
+    pub(crate) fn next_by_kind(
+        &mut self,
+        mut predicate: impl FnMut(SyntaxKind) -> bool,
+    ) -> Option<SyntaxNode> {
         loop {
             let index = self.next_index;
             self.next_index += 1;
             let child = self.parent.green_ref().child_at(index)?;
             let Some(green) = child.as_ref().into_node() else { continue };
-            if (self.predicate)(green.kind()) {
+            if predicate(green.kind()) {
                 return Some(SyntaxNode::new_child(
                     green,
                     self.parent.clone(),
@@ -931,10 +916,7 @@ impl Iterator for SyntaxNodeChildrenByKind {
 impl Iterator for SyntaxNodeChildren {
     type Item = SyntaxNode;
     fn next(&mut self) -> Option<SyntaxNode> {
-        self.next.take().map(|next| {
-            self.next = next.next_sibling();
-            next
-        })
+        self.next_by_kind(|_| true)
     }
 }
 

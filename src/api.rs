@@ -141,15 +141,6 @@ impl<L: Language> SyntaxNode<L> {
         SyntaxNodeChildren { raw: self.raw.children(), _p: PhantomData }
     }
 
-    /// Iterates direct children whose raw syntax kind satisfies `predicate`.
-    #[inline]
-    pub fn children_by_raw_kind(
-        &self,
-        predicate: fn(SyntaxKind) -> bool,
-    ) -> SyntaxNodeChildrenByKind<L> {
-        SyntaxNodeChildrenByKind { raw: self.raw.children_by_kind(predicate), _p: PhantomData }
-    }
-
     pub fn children_with_tokens(&self) -> SyntaxElementChildren<L> {
         SyntaxElementChildren { raw: self.raw.children_with_tokens(), _p: PhantomData }
     }
@@ -404,24 +395,17 @@ pub struct SyntaxNodeChildren<L: Language> {
     _p: PhantomData<L>,
 }
 
-#[derive(Debug, Clone)]
-pub struct SyntaxNodeChildrenByKind<L: Language> {
-    raw: cursor::SyntaxNodeChildrenByKind,
-    _p: PhantomData<L>,
-}
-
-impl<L: Language> Iterator for SyntaxNodeChildrenByKind<L> {
+impl<L: Language> Iterator for SyntaxNodeChildren<L> {
     type Item = SyntaxNode<L>;
-
     fn next(&mut self) -> Option<Self::Item> {
         self.raw.next().map(SyntaxNode::from)
     }
 }
 
-impl<L: Language> Iterator for SyntaxNodeChildren<L> {
-    type Item = SyntaxNode<L>;
-    fn next(&mut self) -> Option<Self::Item> {
-        self.raw.next().map(SyntaxNode::from)
+impl<L: Language> SyntaxNodeChildren<L> {
+    #[inline]
+    pub fn next_by_kind(&mut self, predicate: fn(L::Kind) -> bool) -> Option<SyntaxNode<L>> {
+        self.raw.next_by_kind(|kind| predicate(L::kind_from_raw(kind))).map(SyntaxNode::from)
     }
 }
 
@@ -575,10 +559,11 @@ mod tests {
         builder.finish_node();
         let root = SyntaxNode::<TestLanguage>::new_root(builder.finish());
 
-        let kinds = root
-            .children_by_raw_kind(|kind| kind == SyntaxKind(1))
-            .map(|it| it.kind())
-            .collect::<Vec<_>>();
+        let mut children = root.children();
+        let kinds = [
+            children.next_by_kind(|kind| kind == SyntaxKind(1)).unwrap().kind(),
+            children.next_by_kind(|kind| kind == SyntaxKind(1)).unwrap().kind(),
+        ];
 
         assert_eq!(kinds, [SyntaxKind(1), SyntaxKind(1)]);
     }
