@@ -377,6 +377,14 @@ impl SyntaxNode {
     }
 
     #[inline]
+    pub(crate) fn children_by_kind(
+        &self,
+        predicate: fn(SyntaxKind) -> bool,
+    ) -> SyntaxNodeChildrenByKind {
+        SyntaxNodeChildrenByKind { parent: self.clone(), next_index: 0, predicate }
+    }
+
+    #[inline]
     pub fn children_with_tokens(&self) -> SyntaxElementChildren {
         SyntaxElementChildren::new(self.clone())
     }
@@ -889,6 +897,34 @@ pub struct SyntaxNodeChildren {
 impl SyntaxNodeChildren {
     fn new(parent: SyntaxNode) -> SyntaxNodeChildren {
         SyntaxNodeChildren { next: parent.first_child() }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SyntaxNodeChildrenByKind {
+    parent: SyntaxNode,
+    next_index: usize,
+    predicate: fn(SyntaxKind) -> bool,
+}
+
+impl Iterator for SyntaxNodeChildrenByKind {
+    type Item = SyntaxNode;
+
+    fn next(&mut self) -> Option<SyntaxNode> {
+        loop {
+            let index = self.next_index;
+            self.next_index += 1;
+            let child = self.parent.green_ref().child_at(index)?;
+            let Some(green) = child.as_ref().into_node() else { continue };
+            if (self.predicate)(green.kind()) {
+                return Some(SyntaxNode::new_child(
+                    green,
+                    self.parent.clone(),
+                    index as u32,
+                    self.parent.offset() + child.rel_offset(),
+                ));
+            }
+        }
     }
 }
 

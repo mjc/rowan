@@ -141,6 +141,15 @@ impl<L: Language> SyntaxNode<L> {
         SyntaxNodeChildren { raw: self.raw.children(), _p: PhantomData }
     }
 
+    /// Iterates direct children whose raw syntax kind satisfies `predicate`.
+    #[inline]
+    pub fn children_by_raw_kind(
+        &self,
+        predicate: fn(SyntaxKind) -> bool,
+    ) -> SyntaxNodeChildrenByKind<L> {
+        SyntaxNodeChildrenByKind { raw: self.raw.children_by_kind(predicate), _p: PhantomData }
+    }
+
     pub fn children_with_tokens(&self) -> SyntaxElementChildren<L> {
         SyntaxElementChildren { raw: self.raw.children_with_tokens(), _p: PhantomData }
     }
@@ -395,6 +404,20 @@ pub struct SyntaxNodeChildren<L: Language> {
     _p: PhantomData<L>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SyntaxNodeChildrenByKind<L: Language> {
+    raw: cursor::SyntaxNodeChildrenByKind,
+    _p: PhantomData<L>,
+}
+
+impl<L: Language> Iterator for SyntaxNodeChildrenByKind<L> {
+    type Item = SyntaxNode<L>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.raw.next().map(SyntaxNode::from)
+    }
+}
+
 impl<L: Language> Iterator for SyntaxNodeChildren<L> {
     type Item = SyntaxNode<L>;
     fn next(&mut self) -> Option<Self::Item> {
@@ -536,5 +559,27 @@ mod tests {
         );
 
         assert_eq!(found, (SyntaxKind(4), "middle".to_string()));
+    }
+
+    #[test]
+    fn filtered_children_skip_non_matching_children() {
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(SyntaxKind(0));
+        builder.start_node(SyntaxKind(1));
+        builder.finish_node();
+        builder.token(SyntaxKind(2), "middle");
+        builder.start_node(SyntaxKind(3));
+        builder.finish_node();
+        builder.start_node(SyntaxKind(1));
+        builder.finish_node();
+        builder.finish_node();
+        let root = SyntaxNode::<TestLanguage>::new_root(builder.finish());
+
+        let kinds = root
+            .children_by_raw_kind(|kind| kind == SyntaxKind(1))
+            .map(|it| it.kind())
+            .collect::<Vec<_>>();
+
+        assert_eq!(kinds, [SyntaxKind(1), SyntaxKind(1)]);
     }
 }

@@ -133,6 +133,11 @@ impl GreenNodeData {
         Children { raw: self.slice().iter() }
     }
 
+    #[inline]
+    pub(crate) fn child_at(&self, index: usize) -> Option<&GreenChild> {
+        self.slice().get(index)
+    }
+
     pub(crate) fn child_at_range(
         &self,
         rel_range: TextRange,
