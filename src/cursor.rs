@@ -962,22 +962,31 @@ impl Iterator for SyntaxNodeChildren {
 
 #[derive(Clone, Debug)]
 pub struct SyntaxElementChildren {
-    next: Option<SyntaxElement>,
+    parent: SyntaxNode,
+    next_index: usize,
+    next_offset: TextSize,
 }
 
 impl SyntaxElementChildren {
     fn new(parent: SyntaxNode) -> SyntaxElementChildren {
-        SyntaxElementChildren { next: parent.first_child_or_token() }
+        SyntaxElementChildren { parent, next_index: 0, next_offset: 0.into() }
     }
 }
 
 impl Iterator for SyntaxElementChildren {
     type Item = SyntaxElement;
     fn next(&mut self) -> Option<SyntaxElement> {
-        self.next.take().map(|next| {
-            self.next = next.next_sibling_or_token();
-            next
-        })
+        let index = self.next_index;
+        let child = self.parent.green_ref().child(index)?;
+        let rel_offset = self.next_offset;
+        self.next_index += 1;
+        self.next_offset += child.text_len();
+        Some(SyntaxElement::new(
+            child,
+            self.parent.clone(),
+            index as u32,
+            self.parent.offset() + rel_offset,
+        ))
     }
 }
 
