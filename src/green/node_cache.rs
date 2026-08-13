@@ -113,19 +113,22 @@ impl SharedNodeCache {
                 BuildHasherDefault::default(),
             );
         }
-        if let Some((cached, ())) = shard.raw_entry().from_hash(hash, |cached| cached.0 == node) {
-            return cached.0.clone();
-        }
         if shard.len() >= NODE_CAPACITY_PER_SHARD {
+            if let Some((cached, ())) = shard.raw_entry().from_hash(hash, |cached| cached.0 == node)
+            {
+                return cached.0.clone();
+            }
             shard.clear();
         }
-        let RawEntryMut::Vacant(entry) =
-            shard.raw_entry_mut().from_hash(hash, |cached| cached.0 == node)
-        else {
-            unreachable!()
-        };
-        entry.insert_with_hasher(hash, NoHash(node.clone()), (), |cached| node_hash(&cached.0));
-        node
+        match shard.raw_entry_mut().from_hash(hash, |cached| cached.0 == node) {
+            RawEntryMut::Occupied(entry) => entry.key().0.clone(),
+            RawEntryMut::Vacant(entry) => {
+                entry.insert_with_hasher(hash, NoHash(node.clone()), (), |cached| {
+                    node_hash(&cached.0)
+                });
+                node
+            }
+        }
     }
 
     fn token(&self, hash: u64, kind: SyntaxKind, text: &str) -> Option<GreenToken> {
@@ -142,19 +145,29 @@ impl SharedNodeCache {
         let mut shard = self.tokens[hash as usize % SHARD_COUNT]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((cached, ())) = shard.raw_entry().from_hash(hash, |cached| cached.0 == token) {
-            return cached.0.clone();
+        if shard.capacity() == 0 {
+            *shard = HashMap::with_capacity_and_hasher(
+                TOKEN_CAPACITY_PER_SHARD,
+                BuildHasherDefault::default(),
+            );
         }
         if shard.len() >= TOKEN_CAPACITY_PER_SHARD {
+            if let Some((cached, ())) =
+                shard.raw_entry().from_hash(hash, |cached| cached.0 == token)
+            {
+                return cached.0.clone();
+            }
             shard.clear();
         }
-        let RawEntryMut::Vacant(entry) =
-            shard.raw_entry_mut().from_hash(hash, |cached| cached.0 == token)
-        else {
-            unreachable!()
-        };
-        entry.insert_with_hasher(hash, NoHash(token.clone()), (), |cached| token_hash(&cached.0));
-        token
+        match shard.raw_entry_mut().from_hash(hash, |cached| cached.0 == token) {
+            RawEntryMut::Occupied(entry) => entry.key().0.clone(),
+            RawEntryMut::Vacant(entry) => {
+                entry.insert_with_hasher(hash, NoHash(token.clone()), (), |cached| {
+                    token_hash(&cached.0)
+                });
+                token
+            }
+        }
     }
 }
 
@@ -190,12 +203,6 @@ impl NodeCache {
         };
 
         let children_ref = &children[first_child..];
-        if shared_cache.is_some()
-            && (children_ref.len() > MAX_SHARED_NODE_CHILDREN
-                || children_ref.iter().any(|&(_, hash, _)| hash == 0))
-        {
-            return (0, 0, build_node(children));
-        }
         let structural_hash = {
             let mut h = FxHasher::default();
             kind.hash(&mut h);
@@ -206,6 +213,9 @@ impl NodeCache {
         };
 
         if let Some(cache) = shared_cache {
+            if children_ref.len() > MAX_SHARED_NODE_CHILDREN {
+                return (0, structural_hash, build_node(children));
+            }
             if let Some(node) = cache.node(structural_hash, kind, children_ref) {
                 drop(children.drain(first_child..));
                 return (0, structural_hash, node);
@@ -270,7 +280,7 @@ impl NodeCache {
 
         if let Some(cache) = shared_cache {
             if text.len() > MAX_SHARED_TOKEN_LEN {
-                return (0, GreenToken::new(kind, text));
+                return (hash, GreenToken::new(kind, text));
             }
             let token = cache
                 .token(hash, kind, text)
@@ -318,10 +328,12 @@ mod tests {
     }
 
     #[test]
-    fn shared_cache_reserves_bounded_node_shards_on_first_use() {
+    fn shared_cache_reserves_bounded_shards_on_first_use() {
         let cache = SharedNodeCache::default();
         cache.insert_node(0, GreenNode::new(SyntaxKind(1), []));
+        cache.insert_token(0, GreenToken::new(SyntaxKind(1), "x"));
 
         assert!(cache.nodes[0].lock().unwrap().capacity() >= NODE_CAPACITY_PER_SHARD);
+        assert!(cache.tokens[0].lock().unwrap().capacity() >= TOKEN_CAPACITY_PER_SHARD);
     }
 }
