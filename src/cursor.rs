@@ -922,11 +922,12 @@ impl From<SyntaxToken> for SyntaxElement {
 pub struct SyntaxNodeChildren {
     parent: SyntaxNode,
     next_index: usize,
+    next_offset: TextSize,
 }
 
 impl SyntaxNodeChildren {
     fn new(parent: SyntaxNode) -> SyntaxNodeChildren {
-        SyntaxNodeChildren { parent, next_index: 0 }
+        SyntaxNodeChildren { parent, next_index: 0, next_offset: 0.into() }
     }
 
     pub(crate) fn next_by_kind(
@@ -936,18 +937,16 @@ impl SyntaxNodeChildren {
         loop {
             let index = self.next_index;
             self.next_index += 1;
-            let parent = self.parent.green_ref();
-            if index >= parent.child_count() {
-                return None;
-            }
-            let child = parent.child_with_offset(index);
-            let Some(green) = child.as_ref().into_node() else { continue };
+            let child = self.parent.green_ref().child(index)?;
+            let rel_offset = self.next_offset;
+            self.next_offset += child.text_len();
+            let Some(green) = child.into_node() else { continue };
             if predicate(green.kind()) {
                 return Some(SyntaxNode::new_child(
                     green,
                     self.parent.clone(),
                     index as u32,
-                    self.parent.offset() + child.rel_offset(),
+                    self.parent.offset() + rel_offset,
                 ));
             }
         }

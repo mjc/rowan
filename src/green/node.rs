@@ -182,6 +182,11 @@ impl GreenNodeData {
     }
 
     #[inline]
+    pub(crate) fn child(&self, index: usize) -> Option<GreenElementRef<'_>> {
+        self.slice().get(index).map(GreenChild::as_ref)
+    }
+
+    #[inline]
     pub(crate) fn child_with_offset(&self, index: usize) -> GreenChildRef<'_> {
         let block = index / CHILDREN_PER_CHECKPOINT;
         let block_start = block * CHILDREN_PER_CHECKPOINT;
