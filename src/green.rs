@@ -46,6 +46,7 @@ mod tests {
         eprintln!("GreenToken         {}", size_of::<GreenToken>());
         eprintln!("GreenElement       {}", size_of::<GreenElement>());
         assert_eq!(size_of::<GreenNode>(), size_of::<usize>());
+        assert_eq!(size_of::<GreenNodeData>(), size_of::<usize>());
         assert_eq!(size_of::<GreenChild>(), size_of::<usize>());
     }
 
@@ -196,5 +197,19 @@ mod tests {
         let kind = SyntaxKind(0);
         let children = PanicAfterOne { child: Some(GreenToken::new(kind, "child").into()) };
         assert!(std::panic::catch_unwind(|| GreenNode::new(kind, children)).is_err());
+    }
+
+    #[test]
+    fn wide_child_counts_preserve_the_full_count() {
+        let kind = SyntaxKind(0);
+        let token = GreenToken::new(kind, "x");
+        let child_count = u16::MAX as usize;
+        let node = GreenNode::new(kind, (0..child_count).map(|_| token.clone().into()));
+        let cloned = node.clone();
+        drop(node);
+
+        assert_eq!(cloned.children().len(), child_count);
+        assert_eq!(cloned.text_len(), (child_count as u32).into());
+        assert_eq!(cloned.child_offset(child_count - 1), ((child_count - 1) as u32).into());
     }
 }

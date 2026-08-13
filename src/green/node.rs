@@ -25,6 +25,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct GreenNodeHead {
     kind: SyntaxKind,
+    child_count: u16,
     text_len: TextSize,
     _c: Count<GreenNode>,
 }
@@ -43,14 +44,24 @@ static_assert!(mem::align_of::<GreenNodeData>() >= 2);
 static_assert!(mem::align_of::<GreenTokenData>() >= 2);
 
 const CHILDREN_PER_CHECKPOINT: usize = 4;
+const WIDE_CHILD_COUNT: u16 = u16::MAX;
+#[cfg(target_pointer_width = "64")]
+const MAX_REFCOUNT: usize = i32::MAX as usize;
+#[cfg(target_pointer_width = "64")]
+const REFCOUNT_MASK: usize = u32::MAX as usize;
+#[cfg(not(target_pointer_width = "64"))]
 const MAX_REFCOUNT: usize = isize::MAX as usize;
 
 #[repr(C)]
 pub struct GreenNodeData {
     header: GreenNodeHead,
-    child_count: u32,
     children: [GreenChild; 0],
 }
+
+#[cfg(target_pointer_width = "64")]
+static_assert!(mem::size_of::<GreenNodeHead>() == 8);
+#[cfg(target_pointer_width = "64")]
+static_assert!(mem::size_of::<GreenNodeData>() == 8);
 
 #[repr(C)]
 struct GreenNodeAllocation {
@@ -69,8 +80,7 @@ impl Drop for GreenNodeAllocGuard {
         // SAFETY: The guard owns the unpublished allocation and tracks exactly how many
         // children were initialized before construction unwound.
         unsafe {
-            let child_ptr =
-                ptr::addr_of_mut!((*self.allocation.as_ptr()).data.children).cast::<GreenChild>();
+            let child_ptr = allocation_child_ptr(self.allocation, self.child_count);
             for index in 0..self.initialized_children {
                 ptr::drop_in_place(child_ptr.add(index));
             }
@@ -153,48 +163,75 @@ impl GreenNodeData {
     }
 
     #[inline]
-    fn slice(&self) -> &[GreenChild] {
-        // SAFETY: The allocation stores exactly `child_count` initialized children here.
-        unsafe { slice::from_raw_parts(self.children.as_ptr(), self.child_count as usize) }
+    fn child_ptr(&self) -> *const GreenChild {
+        #[cfg(target_pointer_width = "64")]
+        {
+            self.children.as_ptr()
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            self.children
+                .as_ptr()
+                .wrapping_add(usize::from(self.header.child_count == WIDE_CHILD_COUNT))
+        }
     }
 
     #[inline]
-    fn checkpoints(&self) -> &[TextSize] {
-        let len = (self.child_count as usize).saturating_sub(1) / CHILDREN_PER_CHECKPOINT;
-        let ptr = self.children.as_ptr().wrapping_add(self.child_count as usize).cast();
+    unsafe fn slice_with_count(&self, child_count: usize) -> &[GreenChild] {
+        // SAFETY: The allocation stores exactly `child_count` initialized children here,
+        // after one wide-count slot when the inline count is the sentinel.
+        unsafe { slice::from_raw_parts(self.child_ptr(), child_count) }
+    }
+
+    #[inline]
+    fn checkpoints_with_count(&self, child_count: usize) -> &[TextSize] {
+        let len = child_count.saturating_sub(1) / CHILDREN_PER_CHECKPOINT;
+        let ptr = self.child_ptr().wrapping_add(child_count).cast();
         // SAFETY: Construction writes one checkpoint after the child tail for every block after
         // the first. The first block always starts at zero.
         unsafe { slice::from_raw_parts(ptr, len) }
     }
 
     #[inline]
-    fn block_offset(&self, block: usize) -> TextSize {
+    fn block_offset(checkpoints: &[TextSize], block: usize) -> TextSize {
         if block == 0 {
             0.into()
         } else {
-            self.checkpoints()[block - 1]
+            checkpoints[block - 1]
         }
     }
 
     #[inline]
     pub(crate) fn child_count(&self) -> usize {
-        self.child_count as usize
+        if self.header.child_count != WIDE_CHILD_COUNT {
+            self.header.child_count as usize
+        } else {
+            self.wide_child_count()
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn wide_child_count(&self) -> usize {
+        #[cfg(target_pointer_width = "64")]
+        {
+            // SAFETY: `self` is embedded in a live `GreenNodeAllocation`.
+            let allocation = unsafe { allocation_ptr(ptr::NonNull::from(self)).as_ref() };
+            allocation.count.load(Relaxed) >> 32
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            // SAFETY: Wide nodes store their u32 count in the aligned slot immediately
+            // preceding the child tail.
+            unsafe { self.children.as_ptr().cast::<u32>().read() as usize }
+        }
     }
 
     #[inline]
     pub(crate) fn child(&self, index: usize) -> Option<GreenElementRef<'_>> {
-        self.slice().get(index).map(GreenChild::as_ref)
-    }
-
-    #[inline]
-    pub(crate) fn child_with_offset(&self, index: usize) -> GreenChildRef<'_> {
-        let block = index / CHILDREN_PER_CHECKPOINT;
-        let block_start = block * CHILDREN_PER_CHECKPOINT;
-        let mut rel_offset = self.block_offset(block);
-        for child in &self.slice()[block_start..index] {
-            rel_offset += child.as_ref().text_len();
-        }
-        GreenChildRef { element: self.slice()[index].as_ref(), rel_offset }
+        let child_count = self.child_count();
+        // SAFETY: `child_count()` decodes the count stored by construction.
+        unsafe { self.slice_with_count(child_count) }.get(index).map(GreenChild::as_ref)
     }
 
     #[inline]
@@ -224,19 +261,28 @@ impl GreenNodeData {
         &self,
         rel_range: TextRange,
     ) -> Option<(usize, TextSize, GreenElementRef<'_>)> {
-        if self.child_count() == 0 {
+        let child_count = self.child_count();
+        if child_count == 0 {
             return None;
         }
-        let block = self.checkpoints().partition_point(|&offset| offset <= rel_range.start());
+        // SAFETY: `child_count()` decodes the count stored by construction.
+        let children = unsafe { self.slice_with_count(child_count) };
+        let checkpoints = self.checkpoints_with_count(child_count);
+        let block = checkpoints.partition_point(|&offset| offset <= rel_range.start());
         let start = block * CHILDREN_PER_CHECKPOINT;
-        let end = (start + CHILDREN_PER_CHECKPOINT).min(self.slice().len());
-        let mut rel_offset = self.block_offset(block);
+        let end = (start + CHILDREN_PER_CHECKPOINT).min(child_count);
+        let mut rel_offset = Self::block_offset(checkpoints, block);
         let mut candidate = start.checked_sub(1).map(|index| {
-            let child = self.child_with_offset(index);
-            (index, child.rel_offset, child.element)
+            let previous_block = index / CHILDREN_PER_CHECKPOINT;
+            let previous_block_start = previous_block * CHILDREN_PER_CHECKPOINT;
+            let mut previous_offset = Self::block_offset(checkpoints, previous_block);
+            for child in &children[previous_block_start..index] {
+                previous_offset += child.as_ref().text_len();
+            }
+            (index, previous_offset, children[index].as_ref())
         });
         for index in start..end {
-            let element = self.slice()[index].as_ref();
+            let element = children[index].as_ref();
             let child_range = TextRange::at(rel_offset, element.text_len());
             let current = (index, rel_offset, element);
             rel_offset += element.text_len();
@@ -259,7 +305,7 @@ impl GreenNodeData {
 
     #[cfg(test)]
     pub(crate) fn child_offset(&self, index: usize) -> TextSize {
-        self.child_with_offset(index).rel_offset
+        self.children_with_offsets().nth(index).unwrap().rel_offset
     }
     #[must_use]
     pub fn replace_child(&self, index: usize, new_child: GreenElement) -> GreenNode {
@@ -308,15 +354,45 @@ fn allocation_layout(child_count: usize) -> Layout {
     let checkpoints = child_count.saturating_sub(1) / CHILDREN_PER_CHECKPOINT;
     let children_offset =
         offset_of!(GreenNodeAllocation, data) + offset_of!(GreenNodeData, children);
+    let wide_count_size = mem::size_of::<GreenChild>() * wide_count_slots(child_count);
+    let children_size = mem::size_of::<GreenChild>()
+        .checked_mul(child_count)
+        .expect("green node child allocation size overflows");
+    let checkpoints_size = mem::size_of::<TextSize>()
+        .checked_mul(checkpoints)
+        .expect("green node checkpoint allocation size overflows");
     let usable_size = children_offset
-        .checked_add(mem::size_of::<GreenChild>().checked_mul(child_count).unwrap())
-        .and_then(|size| {
-            size.checked_add(mem::size_of::<TextSize>().checked_mul(checkpoints).unwrap())
-        })
+        .checked_add(wide_count_size)
+        .and_then(|size| size.checked_add(children_size))
+        .and_then(|size| size.checked_add(checkpoints_size))
         .expect("green node allocation size overflows");
     let align = mem::align_of::<GreenNodeAllocation>();
     let size = usable_size.checked_add(align - 1).unwrap() & !(align - 1);
     Layout::from_size_align(size, align).expect("invalid green node allocation layout")
+}
+
+#[inline]
+const fn wide_count_slots(child_count: usize) -> usize {
+    #[cfg(target_pointer_width = "64")]
+    {
+        let _ = child_count;
+        0
+    }
+    #[cfg(not(target_pointer_width = "64"))]
+    {
+        usize::from(child_count >= WIDE_CHILD_COUNT as usize)
+    }
+}
+
+unsafe fn allocation_child_ptr(
+    allocation: ptr::NonNull<GreenNodeAllocation>,
+    child_count: usize,
+) -> *mut GreenChild {
+    unsafe {
+        ptr::addr_of_mut!((*allocation.as_ptr()).data.children)
+            .cast::<GreenChild>()
+            .add(wide_count_slots(child_count))
+    }
 }
 
 #[inline]
@@ -332,6 +408,8 @@ impl Clone for GreenNode {
         // SAFETY: `self` keeps the allocation alive.
         let allocation = unsafe { allocation_ptr(self.ptr).as_ref() };
         let old_size = allocation.count.fetch_add(1, Relaxed);
+        #[cfg(target_pointer_width = "64")]
+        let old_size = old_size & REFCOUNT_MASK;
         if old_size > MAX_REFCOUNT {
             std::process::abort();
         }
@@ -344,7 +422,10 @@ impl Drop for GreenNode {
     fn drop(&mut self) {
         // SAFETY: `self` owns one strong reference.
         let allocation = unsafe { allocation_ptr(self.ptr) };
-        if unsafe { allocation.as_ref() }.count.fetch_sub(1, Release) != 1 {
+        let old_size = unsafe { allocation.as_ref() }.count.fetch_sub(1, Release);
+        #[cfg(target_pointer_width = "64")]
+        let old_size = old_size & REFCOUNT_MASK;
+        if old_size != 1 {
             return;
         }
         // SAFETY: This was the final strong reference.
@@ -357,8 +438,9 @@ impl GreenNode {
     unsafe fn drop_slow(&mut self, allocation: ptr::NonNull<GreenNodeAllocation>) {
         unsafe { allocation.as_ref() }.count.load(Acquire);
 
-        let child_count = self.child_count as usize;
-        for child in self.slice() {
+        let child_count = self.child_count();
+        // SAFETY: `child_count()` decodes the count stored by construction.
+        for child in unsafe { self.slice_with_count(child_count) } {
             // SAFETY: This is the final strong reference, so every initialized child
             // can be dropped exactly once.
             unsafe { ptr::drop_in_place(child as *const GreenChild as *mut GreenChild) };
@@ -410,6 +492,11 @@ impl GreenNode {
         let child_count = children.len();
         let stored_child_count =
             u32::try_from(child_count).expect("green node child count exceeds u32::MAX");
+        let inline_child_count = if child_count >= WIDE_CHILD_COUNT as usize {
+            WIDE_CHILD_COUNT
+        } else {
+            child_count as u16
+        };
         let layout = allocation_layout(child_count);
         // SAFETY: `layout` is non-zero and valid.
         let buffer = unsafe { alloc::alloc(layout) };
@@ -420,19 +507,31 @@ impl GreenNode {
         // SAFETY: `alloc::alloc` returned a non-null pointer aligned for this layout.
         let allocation = unsafe { ptr::NonNull::new_unchecked(allocation) };
         let mut guard = GreenNodeAllocGuard { allocation, child_count, initialized_children: 0 };
-        // SAFETY: The allocation is valid and properly aligned for all writes below.
+        #[cfg(target_pointer_width = "64")]
+        let initial_count = (stored_child_count as usize) << 32 | 1;
+        #[cfg(not(target_pointer_width = "64"))]
+        let initial_count = 1;
+        // SAFETY: The allocation is valid and properly aligned for this write.
         unsafe {
-            ptr::write(ptr::addr_of_mut!((*allocation.as_ptr()).count), AtomicUsize::new(1));
             ptr::write(
-                ptr::addr_of_mut!((*allocation.as_ptr()).data.child_count),
-                stored_child_count,
-            );
-        }
+                ptr::addr_of_mut!((*allocation.as_ptr()).count),
+                AtomicUsize::new(initial_count),
+            )
+        };
 
         let mut text_len: TextSize = 0.into();
-        // SAFETY: `children` is the start of the packed child tail.
-        let child_ptr =
-            unsafe { ptr::addr_of_mut!((*allocation.as_ptr()).data.children).cast::<GreenChild>() };
+        #[cfg(not(target_pointer_width = "64"))]
+        if inline_child_count == WIDE_CHILD_COUNT {
+            // SAFETY: Wide layouts reserve one aligned slot before the child tail.
+            unsafe {
+                ptr::write(
+                    ptr::addr_of_mut!((*allocation.as_ptr()).data.children).cast::<u32>(),
+                    stored_child_count,
+                )
+            };
+        }
+        // SAFETY: `allocation_child_ptr` accounts for the optional wide-count slot.
+        let child_ptr = unsafe { allocation_child_ptr(allocation, child_count) };
         // SAFETY: The checkpoint tail immediately follows all children and remains aligned.
         let checkpoint_ptr = unsafe { child_ptr.add(child_count).cast::<TextSize>() };
         for index in 0..child_count {
@@ -453,7 +552,7 @@ impl GreenNode {
         unsafe {
             ptr::write(
                 ptr::addr_of_mut!((*allocation.as_ptr()).data.header),
-                GreenNodeHead { kind, text_len, _c: Count::new() },
+                GreenNodeHead { kind, child_count: inline_child_count, text_len, _c: Count::new() },
             );
         }
         mem::forget(guard);
@@ -610,11 +709,14 @@ pub(crate) struct GreenChildren<'a> {
 impl<'a> GreenChildren<'a> {
     #[inline]
     fn new(node: &'a GreenNodeData) -> Self {
+        let child_count = node.child_count();
+        // SAFETY: `child_count()` decodes the count stored by construction.
+        let children = unsafe { node.slice_with_count(child_count) };
         GreenChildren {
-            children: node.slice(),
-            checkpoints: node.checkpoints(),
+            children,
+            checkpoints: node.checkpoints_with_count(child_count),
             front: 0,
-            back: node.slice().len(),
+            back: child_count,
             front_offset: 0.into(),
             back_offset: node.text_len(),
         }
