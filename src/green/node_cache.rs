@@ -113,22 +113,19 @@ impl SharedNodeCache {
                 BuildHasherDefault::default(),
             );
         }
+        if let Some((cached, ())) = shard.raw_entry().from_hash(hash, |cached| cached.0 == node) {
+            return cached.0.clone();
+        }
         if shard.len() >= NODE_CAPACITY_PER_SHARD {
-            if let Some((cached, ())) = shard.raw_entry().from_hash(hash, |cached| cached.0 == node)
-            {
-                return cached.0.clone();
-            }
             shard.clear();
         }
-        match shard.raw_entry_mut().from_hash(hash, |cached| cached.0 == node) {
-            RawEntryMut::Occupied(entry) => entry.key().0.clone(),
-            RawEntryMut::Vacant(entry) => {
-                entry.insert_with_hasher(hash, NoHash(node.clone()), (), |cached| {
-                    node_hash(&cached.0)
-                });
-                node
-            }
-        }
+        let RawEntryMut::Vacant(entry) =
+            shard.raw_entry_mut().from_hash(hash, |cached| cached.0 == node)
+        else {
+            unreachable!()
+        };
+        entry.insert_with_hasher(hash, NoHash(node.clone()), (), |cached| node_hash(&cached.0));
+        node
     }
 
     fn token(&self, hash: u64, kind: SyntaxKind, text: &str) -> Option<GreenToken> {
@@ -151,23 +148,19 @@ impl SharedNodeCache {
                 BuildHasherDefault::default(),
             );
         }
+        if let Some((cached, ())) = shard.raw_entry().from_hash(hash, |cached| cached.0 == token) {
+            return cached.0.clone();
+        }
         if shard.len() >= TOKEN_CAPACITY_PER_SHARD {
-            if let Some((cached, ())) =
-                shard.raw_entry().from_hash(hash, |cached| cached.0 == token)
-            {
-                return cached.0.clone();
-            }
             shard.clear();
         }
-        match shard.raw_entry_mut().from_hash(hash, |cached| cached.0 == token) {
-            RawEntryMut::Occupied(entry) => entry.key().0.clone(),
-            RawEntryMut::Vacant(entry) => {
-                entry.insert_with_hasher(hash, NoHash(token.clone()), (), |cached| {
-                    token_hash(&cached.0)
-                });
-                token
-            }
-        }
+        let RawEntryMut::Vacant(entry) =
+            shard.raw_entry_mut().from_hash(hash, |cached| cached.0 == token)
+        else {
+            unreachable!()
+        };
+        entry.insert_with_hasher(hash, NoHash(token.clone()), (), |cached| token_hash(&cached.0));
+        token
     }
 }
 
@@ -206,8 +199,14 @@ impl NodeCache {
         let structural_hash = {
             let mut h = FxHasher::default();
             kind.hash(&mut h);
-            for &(_, hash, _) in children_ref {
-                hash.hash(&mut h);
+            match children_ref {
+                [] => {}
+                [(_, hash, _)] => hash.hash(&mut h),
+                _ => {
+                    for &(_, hash, _) in children_ref {
+                        hash.hash(&mut h);
+                    }
+                }
             }
             h.finish()
         };
