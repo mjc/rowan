@@ -29,6 +29,7 @@ mod tests {
     use super::node::GreenChild;
     #[cfg(target_pointer_width = "64")]
     use super::node::{allocation_layout, PackedGreenChild};
+    use super::token::allocation_layout as token_allocation_layout;
     use super::*;
     use crate::{TextRange, TextSize};
 
@@ -51,6 +52,9 @@ mod tests {
         #[cfg(target_pointer_width = "64")]
         assert_eq!(size_of::<GreenNodeData>(), size_of::<u32>());
         assert_eq!(size_of::<GreenChild>(), size_of::<usize>());
+        assert_eq!(size_of::<GreenTokenData>(), size_of::<u32>());
+        assert_eq!(token_allocation_layout(0, false).size(), 8);
+        assert_eq!(token_allocation_layout(1, false).size(), 12);
         #[cfg(target_pointer_width = "64")]
         {
             assert_eq!(size_of::<PackedGreenChild>(), size_of::<u32>());
@@ -245,5 +249,17 @@ mod tests {
 
         assert_eq!(node.kind(), kind);
         assert_eq!(node.text_len(), 1.into());
+    }
+
+    #[test]
+    fn wide_token_text_lengths_preserve_text_and_ownership() {
+        let text = "x".repeat(u16::MAX as usize);
+        let token = GreenToken::new(SyntaxKind(u16::MAX), &text);
+        let cloned = token.clone();
+        drop(token);
+
+        assert_eq!(cloned.kind(), SyntaxKind(u16::MAX));
+        assert_eq!(cloned.text_len(), (text.len() as u32).into());
+        assert_eq!(cloned.text(), text);
     }
 }
