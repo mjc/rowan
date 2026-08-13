@@ -243,7 +243,7 @@ impl<T: ?Sized + Hash> Hash for Arc<T> {
 #[repr(C)]
 pub(crate) struct HeaderSlice<H, T: ?Sized> {
     pub(crate) header: H,
-    length: usize,
+    length: u32,
     slice: T,
 }
 
@@ -258,7 +258,7 @@ impl<H, T> Deref for HeaderSlice<H, [T; 0]> {
 
     fn deref(&self) -> &Self::Target {
         unsafe {
-            let len = self.length;
+            let len = self.length as usize;
             let fake_slice: *const [T] =
                 ptr::slice_from_raw_parts(self as *const _ as *const T, len);
             &*(fake_slice as *const HeaderSlice<H, [T]>)
@@ -294,7 +294,7 @@ unsafe impl<H: Sync + Send, T: Sync + Send> Sync for ThinArc<H, T> {}
 fn thin_to_thick<H, T>(
     thin: *mut ArcInner<HeaderSlice<H, [T; 0]>>,
 ) -> *mut ArcInner<HeaderSlice<H, [T]>> {
-    let len = unsafe { (*thin).data.length };
+    let len = unsafe { (*thin).data.length as usize };
     let fake_slice: *mut [T] = ptr::slice_from_raw_parts_mut(thin as *mut T, len);
     // Transplants metadata.
     fake_slice as *mut ArcInner<HeaderSlice<H, [T]>>
@@ -332,6 +332,7 @@ impl<H, T> ThinArc<H, T> {
         assert_ne!(mem::size_of::<T>(), 0, "Need to think about ZST");
 
         let num_items = items.len();
+        let stored_len = u32::try_from(num_items).expect("slice length exceeds u32::MAX");
 
         // Offset of the start of the slice in the allocation.
         let inner_to_data_offset = offset_of!(ArcInner<HeaderSlice<H, [T; 0]>>, data);
@@ -374,7 +375,7 @@ impl<H, T> ThinArc<H, T> {
             // we'll just leak the uninitialized memory.
             ptr::write(ptr::addr_of_mut!((*ptr).count), count);
             ptr::write(ptr::addr_of_mut!((*ptr).data.header), header);
-            ptr::write(ptr::addr_of_mut!((*ptr).data.length), num_items);
+            ptr::write(ptr::addr_of_mut!((*ptr).data.length), stored_len);
             if num_items != 0 {
                 let mut current = ptr::addr_of_mut!((*ptr).data.slice) as *mut T;
                 debug_assert_eq!(current as usize - buffer as usize, slice_offset);
@@ -425,7 +426,11 @@ impl<H, T> Arc<HeaderSlice<H, [T]>> {
     /// is not modified.
     #[inline]
     pub(crate) fn into_thin(a: Self) -> ThinArc<H, T> {
-        assert_eq!(a.length, a.slice.len(), "Length needs to be correct for ThinArc to work");
+        assert_eq!(
+            a.length as usize,
+            a.slice.len(),
+            "Length needs to be correct for ThinArc to work"
+        );
         let fat_ptr: *mut ArcInner<HeaderSlice<H, [T]>> = a.ptr();
         mem::forget(a);
         let thin_ptr = fat_ptr as *mut [usize] as *mut usize;

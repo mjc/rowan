@@ -26,9 +26,9 @@ mod tests {
         hash::{Hash, Hasher},
     };
 
-    use super::node::GreenChild;
+    use super::node::{GreenChild, GreenNodeHead};
     use super::*;
-    use crate::{TextRange, TextSize};
+    use crate::{arc::HeaderSlice, TextRange, TextSize};
 
     #[test]
     fn assert_send_sync() {
@@ -47,6 +47,8 @@ mod tests {
         eprintln!("GreenElement       {}", size_of::<GreenElement>());
         #[cfg(target_pointer_width = "64")]
         assert_eq!(size_of::<GreenChild>(), 12);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(size_of::<HeaderSlice<GreenNodeHead, [GreenChild; 0]>>(), 12);
     }
 
     #[test]
