@@ -545,7 +545,6 @@ fn hash_element<H: Hasher>(element: GreenElementRef<'_>, rel_offset: TextSize, s
             false.hash(state);
             node.kind().hash(state);
             node.text_len().hash(state);
-            node.children().len().hash(state);
             for child in node.children_with_offsets() {
                 hash_element(child.element, child.rel_offset, state);
             }
