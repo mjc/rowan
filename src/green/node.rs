@@ -1,7 +1,7 @@
 #[cfg(not(target_pointer_width = "64"))]
 use std::sync::atomic::AtomicUsize;
 use std::{
-    alloc::{self, Layout},
+    alloc::Layout,
     borrow::Borrow,
     fmt,
     hash::{Hash, Hasher},
@@ -19,7 +19,7 @@ use countme::Count;
 use memoffset::offset_of;
 
 use crate::{
-    green::{GreenElement, GreenElementRef, SyntaxKind},
+    green::{allocator, GreenElement, GreenElementRef, SyntaxKind},
     utility_types::static_assert,
     GreenToken, GreenTokenData, NodeOrToken, TextRange, TextSize,
 };
@@ -148,8 +148,8 @@ impl Drop for GreenNodeAllocGuard {
                     ptr::drop_in_place(child_ptr.add(index));
                 }
             }
-            alloc::dealloc(
-                self.allocation.cast().as_ptr(),
+            allocator::deallocate(
+                self.allocation.cast(),
                 allocation_layout(self.child_count, self.wide),
             );
         }
@@ -551,12 +551,8 @@ unsafe fn promote_to_wide(
 ) -> ptr::NonNull<GreenNodeAllocation> {
     let compact_layout = allocation_layout(child_count, false);
     let wide_layout = allocation_layout(child_count, true);
-    let buffer = unsafe { alloc::alloc(wide_layout) };
-    if buffer.is_null() {
-        alloc::handle_alloc_error(wide_layout);
-    }
-    let wide_allocation =
-        unsafe { ptr::NonNull::new_unchecked(buffer.cast::<GreenNodeAllocation>()) };
+    let buffer = unsafe { allocator::allocate(wide_layout) };
+    let wide_allocation = buffer.cast::<GreenNodeAllocation>();
     unsafe {
         ptr::write(ptr::addr_of_mut!((*wide_allocation.as_ptr()).count), GreenNodeRefCount::new(1))
     };
@@ -574,7 +570,7 @@ unsafe fn promote_to_wide(
     let old_checkpoints = unsafe { old_children.add(child_count).cast::<TextSize>() };
     let new_checkpoints = unsafe { new_children.add(child_count).cast::<TextSize>() };
     unsafe { ptr::copy_nonoverlapping(old_checkpoints, new_checkpoints, checkpoints) };
-    unsafe { alloc::dealloc(allocation.cast().as_ptr(), compact_layout) };
+    unsafe { allocator::deallocate(allocation.cast(), compact_layout) };
     wide_allocation
 }
 
@@ -656,7 +652,7 @@ impl GreenNode {
             ptr::drop_in_place(ptr::addr_of_mut!((*self.ptr.as_ptr()).header))
         };
         // SAFETY: `allocation` was allocated with this exact layout and all fields are dropped.
-        unsafe { alloc::dealloc(allocation.cast().as_ptr(), allocation_layout(child_count, wide)) };
+        unsafe { allocator::deallocate(allocation.cast(), allocation_layout(child_count, wide)) };
     }
 }
 
@@ -715,13 +711,8 @@ impl GreenNode {
         };
         let layout = allocation_layout(child_count, wide);
         // SAFETY: `layout` is non-zero and valid.
-        let buffer = unsafe { alloc::alloc(layout) };
-        if buffer.is_null() {
-            alloc::handle_alloc_error(layout);
-        }
-        let allocation = buffer.cast::<GreenNodeAllocation>();
-        // SAFETY: `alloc::alloc` returned a non-null pointer aligned for this layout.
-        let mut allocation = unsafe { ptr::NonNull::new_unchecked(allocation) };
+        let buffer = unsafe { allocator::allocate(layout) };
+        let mut allocation = buffer.cast::<GreenNodeAllocation>();
         let mut guard =
             GreenNodeAllocGuard { allocation, child_count, wide, initialized_children: 0 };
         // SAFETY: The allocation is valid and properly aligned for this write.

@@ -1,3 +1,4 @@
+mod allocator;
 mod node;
 mod token;
 mod element;
@@ -22,6 +23,7 @@ pub struct SyntaxKind(pub u16);
 #[cfg(test)]
 mod tests {
     use std::{
+        alloc::Layout,
         collections::hash_map::DefaultHasher,
         hash::{Hash, Hasher},
     };
@@ -60,6 +62,32 @@ mod tests {
             assert_eq!(size_of::<PackedGreenChild>(), size_of::<u32>());
             assert_eq!(allocation_layout(1, false).size(), 12);
             assert_eq!(allocation_layout(2, false).size(), 16);
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn small_green_allocations_share_and_reuse_pool_pages() {
+        let layout = Layout::from_size_align(20, 4).unwrap();
+        // SAFETY: The returned allocations are used only as raw storage and released with the
+        // same layout.
+        let first = unsafe { super::allocator::allocate(layout) };
+        let second = unsafe { super::allocator::allocate(layout) };
+        assert_eq!(
+            first.addr().get() / super::allocator::PAGE_SIZE,
+            second.addr().get() / super::allocator::PAGE_SIZE,
+        );
+
+        // SAFETY: `first` is live and was returned for `layout`.
+        unsafe { super::allocator::deallocate(first, layout) };
+        // SAFETY: The returned allocation is released below with the same layout.
+        let reused = unsafe { super::allocator::allocate(layout) };
+        assert_eq!(reused, first);
+
+        // SAFETY: Both allocations are live and were returned for `layout`.
+        unsafe {
+            super::allocator::deallocate(reused, layout);
+            super::allocator::deallocate(second, layout);
         }
     }
 

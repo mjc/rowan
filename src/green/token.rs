@@ -1,5 +1,5 @@
 use std::{
-    alloc::{self, Layout},
+    alloc::Layout,
     borrow::Borrow,
     fmt,
     hash::{Hash, Hasher},
@@ -14,7 +14,10 @@ use std::{
 use countme::Count;
 use memoffset::offset_of;
 
-use crate::{green::SyntaxKind, TextSize};
+use crate::{
+    green::{allocator, SyntaxKind},
+    TextSize,
+};
 
 const MAX_REFCOUNT: u32 = i32::MAX as u32;
 const WIDE_TEXT_LEN: u16 = u16::MAX;
@@ -175,12 +178,8 @@ impl GreenToken {
         let packed_head = u32::from(kind.0) | (u32::from(stored_text_len) << u16::BITS);
         let layout = allocation_layout(text_len, wide);
         // SAFETY: `layout` has non-zero size and valid alignment.
-        let buffer = unsafe { alloc::alloc(layout) };
-        if buffer.is_null() {
-            alloc::handle_alloc_error(layout);
-        }
-        let allocation =
-            unsafe { ptr::NonNull::new_unchecked(buffer.cast::<GreenTokenAllocation>()) };
+        let buffer = unsafe { allocator::allocate(layout) };
+        let allocation = buffer.cast::<GreenTokenAllocation>();
         // SAFETY: The allocation reserves each field and the complete trailing text.
         unsafe {
             ptr::write(ptr::addr_of_mut!((*allocation.as_ptr()).count), AtomicU32::new(1));
@@ -247,7 +246,7 @@ impl GreenToken {
         // SAFETY: The count marker was initialized during construction and is dropped once.
         unsafe { ptr::drop_in_place(ptr::addr_of_mut!((*self.ptr.as_ptr())._c)) };
         // SAFETY: `allocation` was allocated with this exact layout and all fields are dropped.
-        unsafe { alloc::dealloc(allocation.cast().as_ptr(), allocation_layout(text_len, wide)) };
+        unsafe { allocator::deallocate(allocation.cast(), allocation_layout(text_len, wide)) };
     }
 }
 
