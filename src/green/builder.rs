@@ -1,6 +1,9 @@
 use crate::{
     cow_mut::CowMut,
-    green::{node_cache::NodeCache, GreenElement, GreenNode, GreenToken, SyntaxKind},
+    green::{
+        node_cache::{NodeCache, SharedNodeCache},
+        GreenElement, GreenNode, GreenToken, SyntaxKind,
+    },
     NodeOrToken,
 };
 
@@ -12,8 +15,9 @@ pub struct Checkpoint(usize);
 #[derive(Default, Debug)]
 pub struct GreenNodeBuilder<'cache> {
     cache: CowMut<'cache, NodeCache>,
+    shared_cache: Option<&'cache SharedNodeCache>,
     parents: Vec<(SyntaxKind, usize)>,
-    children: Vec<(u64, GreenElement)>,
+    children: Vec<(u64, u64, GreenElement)>,
 }
 
 impl GreenNodeBuilder<'_> {
@@ -27,6 +31,17 @@ impl GreenNodeBuilder<'_> {
     pub fn with_cache(cache: &mut NodeCache) -> GreenNodeBuilder<'_> {
         GreenNodeBuilder {
             cache: CowMut::Borrowed(cache),
+            shared_cache: None,
+            parents: Vec::new(),
+            children: Vec::new(),
+        }
+    }
+
+    /// Creates a builder which structurally shares trees with other builders using the same cache.
+    pub fn with_shared_cache(cache: &SharedNodeCache) -> GreenNodeBuilder<'_> {
+        GreenNodeBuilder {
+            cache: CowMut::Owned(NodeCache::default()),
+            shared_cache: Some(cache),
             parents: Vec::new(),
             children: Vec::new(),
         }
@@ -35,15 +50,15 @@ impl GreenNodeBuilder<'_> {
     /// Adds new token to the current branch.
     #[inline]
     pub fn token(&mut self, kind: SyntaxKind, text: &str) {
-        let (hash, token) = self.cache.token(kind, text);
-        self.children.push((hash, token.into()));
+        let (hash, token) = self.cache.token(kind, text, self.shared_cache);
+        self.children.push((hash, hash, token.into()));
     }
 
     /// Adds an existing green token to the current branch.
     #[inline]
     pub fn token_from_green(&mut self, token: GreenToken) {
         let (hash, token) = self.cache.token_from_green(token);
-        self.children.push((hash, token.into()));
+        self.children.push((hash, hash, token.into()));
     }
 
     /// Start new node and make it current.
@@ -58,8 +73,9 @@ impl GreenNodeBuilder<'_> {
     #[inline]
     pub fn finish_node(&mut self) {
         let (kind, first_child) = self.parents.pop().unwrap();
-        let (hash, node) = self.cache.node(kind, &mut self.children, first_child);
-        self.children.push((hash, node.into()));
+        let (hash, structural_hash, node) =
+            self.cache.node(kind, &mut self.children, first_child, self.shared_cache);
+        self.children.push((hash, structural_hash, node.into()));
     }
 
     /// Prepare for maybe wrapping the next node.
@@ -118,9 +134,45 @@ impl GreenNodeBuilder<'_> {
     #[inline]
     pub fn finish(mut self) -> GreenNode {
         assert_eq!(self.children.len(), 1);
-        match self.children.pop().unwrap().1 {
+        match self.children.pop().unwrap().2 {
             NodeOrToken::Node(node) => node,
             NodeOrToken::Token(_) => panic!(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SharedNodeCache;
+
+    fn build(cache: &SharedNodeCache) -> GreenNode {
+        let mut builder = GreenNodeBuilder::with_shared_cache(cache);
+        builder.start_node(SyntaxKind(0));
+        builder.token(SyntaxKind(1), "one");
+        builder.finish_node();
+        builder.finish()
+    }
+
+    #[test]
+    fn shared_cache_reuses_trees_across_builders() {
+        let cache = SharedNodeCache::default();
+        let first = build(&cache);
+        let second = build(&cache);
+
+        assert!(std::ptr::eq::<crate::GreenNodeData>(&*first, &*second));
+    }
+
+    #[test]
+    fn clearing_shared_cache_preserves_returned_trees() {
+        let cache = SharedNodeCache::default();
+        let first = build(&cache);
+
+        cache.clear();
+
+        assert_eq!(first.to_string(), "one");
+        let second = build(&cache);
+        assert!(!std::ptr::eq::<crate::GreenNodeData>(&*first, &*second));
+        assert_eq!(first, second);
     }
 }

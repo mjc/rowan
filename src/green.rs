@@ -11,7 +11,7 @@ pub(crate) use self::{element::GreenElementRef, node::GreenChild};
 pub use self::{
     builder::{Checkpoint, GreenNodeBuilder},
     node::{Children, GreenNode, GreenNodeData},
-    node_cache::NodeCache,
+    node_cache::{NodeCache, SharedNodeCache},
     token::{GreenToken, GreenTokenData},
 };
 

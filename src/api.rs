@@ -2,7 +2,7 @@ use std::{fmt, iter, marker::PhantomData};
 
 use crate::{
     cursor, green::GreenTokenData, Direction, GreenNode, GreenNodeData, GreenToken, NodeOrToken,
-    SyntaxKind, SyntaxText, TextRange, TextSize, TokenAtOffset, WalkEvent,
+    SyntaxKind, SyntaxText, SyntaxTreeId, TextRange, TextSize, TokenAtOffset, WalkEvent,
 };
 
 pub trait Language: Sized + Copy + fmt::Debug + Eq + Ord + std::hash::Hash {
@@ -97,6 +97,10 @@ impl<L: Language> From<SyntaxToken<L>> for SyntaxElement<L> {
 impl<L: Language> SyntaxNode<L> {
     pub fn new_root(green: GreenNode) -> SyntaxNode<L> {
         SyntaxNode::from(cursor::SyntaxNode::new_root(green))
+    }
+
+    pub fn new_root_with_id(green: GreenNode, identity: SyntaxTreeId) -> SyntaxNode<L> {
+        SyntaxNode::from(cursor::SyntaxNode::new_root_with_id(green, identity))
     }
     /// Returns a green tree, equal to the green tree this node
     /// belongs two, except with this node substitute. The complexity

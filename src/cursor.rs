@@ -37,7 +37,9 @@ use std::{
     hash::{Hash, Hasher},
     iter,
     mem::ManuallyDrop,
+    num::NonZeroU32,
     ptr, slice,
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use countme::Count;
@@ -55,6 +57,20 @@ enum Green {
 
 struct _SyntaxElement;
 
+/// Identity shared by all red nodes created for one syntax tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SyntaxTreeId(NonZeroU32);
+
+impl Default for SyntaxTreeId {
+    fn default() -> Self {
+        static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+        let id = NEXT_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .unwrap_or_else(|_| std::process::abort());
+        SyntaxTreeId(NonZeroU32::new(id).unwrap())
+    }
+}
+
 struct NodeData {
     _c: Count<_SyntaxElement>,
 
@@ -63,6 +79,7 @@ struct NodeData {
     index: u32,
     green: Green,
     offset: TextSize,
+    identity: u32,
 }
 
 pub type SyntaxElement = NodeOrToken<SyntaxNode, SyntaxToken>;
@@ -143,6 +160,7 @@ impl NodeData {
         index: u32,
         offset: TextSize,
         green: Green,
+        identity: SyntaxTreeId,
     ) -> ptr::NonNull<NodeData> {
         let parent = ManuallyDrop::new(parent);
         let res = NodeData {
@@ -152,6 +170,7 @@ impl NodeData {
             index,
             green,
             offset,
+            identity: identity.0.get(),
         };
         unsafe { ptr::NonNull::new_unchecked(Box::into_raw(Box::new(res))) }
     }
@@ -173,12 +192,17 @@ impl NodeData {
     }
 
     #[inline]
-    fn key(&self) -> (ptr::NonNull<()>, TextSize) {
+    fn key(&self) -> (SyntaxTreeId, ptr::NonNull<()>, TextSize) {
         let ptr = match &self.green {
             Green::Node { ptr } => ptr.cast(),
             Green::Token { ptr } => ptr.cast(),
         };
-        (ptr, self.offset())
+        (self.tree_id(), ptr, self.offset())
+    }
+
+    #[inline]
+    fn tree_id(&self) -> SyntaxTreeId {
+        SyntaxTreeId(NonZeroU32::new(self.identity).unwrap())
     }
 
     #[inline]
@@ -285,9 +309,13 @@ impl NodeData {
 
 impl SyntaxNode {
     pub fn new_root(green: GreenNode) -> SyntaxNode {
+        SyntaxNode::new_root_with_id(green, SyntaxTreeId::default())
+    }
+
+    pub fn new_root_with_id(green: GreenNode, identity: SyntaxTreeId) -> SyntaxNode {
         let green = GreenNode::into_raw(green);
         let green = Green::Node { ptr: green };
-        SyntaxNode { ptr: NodeData::new(None, 0, 0.into(), green) }
+        SyntaxNode { ptr: NodeData::new(None, 0, 0.into(), green, identity) }
     }
 
     fn new_child(
@@ -296,12 +324,13 @@ impl SyntaxNode {
         index: u32,
         offset: TextSize,
     ) -> SyntaxNode {
+        let identity = parent.data().tree_id();
         let green = Green::Node { ptr: green.into() };
-        SyntaxNode { ptr: NodeData::new(Some(parent), index, offset, green) }
+        SyntaxNode { ptr: NodeData::new(Some(parent), index, offset, green, identity) }
     }
 
     pub fn clone_subtree(&self) -> SyntaxNode {
-        SyntaxNode::new_root(self.green().to_owned())
+        SyntaxNode::new_root_with_id(self.green().to_owned(), self.data().tree_id())
     }
 
     #[inline]
@@ -593,8 +622,9 @@ impl SyntaxToken {
         index: u32,
         offset: TextSize,
     ) -> SyntaxToken {
+        let identity = parent.data().tree_id();
         let green = Green::Token { ptr: green.into() };
-        SyntaxToken { ptr: NodeData::new(Some(parent), index, offset, green) }
+        SyntaxToken { ptr: NodeData::new(Some(parent), index, offset, green, identity) }
     }
 
     #[inline]
@@ -1049,6 +1079,36 @@ impl Iterator for PreorderWithTokens {
             })
         });
         next
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{GreenNode, GreenToken, SyntaxKind};
+
+    use super::{SyntaxNode, SyntaxTreeId};
+
+    #[test]
+    fn shared_green_trees_have_distinct_syntax_identity() {
+        let kind = SyntaxKind(0);
+        let green = GreenNode::new(kind, [GreenToken::new(kind, "token").into()]);
+        let first = SyntaxNode::new_root(green.clone());
+        let second = SyntaxNode::new_root(green);
+
+        assert_ne!(first, second);
+        assert_ne!(first.first_token(), second.first_token());
+    }
+
+    #[test]
+    fn shared_tree_id_preserves_syntax_identity() {
+        let kind = SyntaxKind(0);
+        let green = GreenNode::new(kind, [GreenToken::new(kind, "token").into()]);
+        let identity = SyntaxTreeId::default();
+        let first = SyntaxNode::new_root_with_id(green.clone(), identity);
+        let second = SyntaxNode::new_root_with_id(green, identity);
+
+        assert_eq!(first, second);
+        assert_eq!(first.first_token(), second.first_token());
     }
 }
 // endregion
