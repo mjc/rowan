@@ -107,6 +107,12 @@ impl SharedNodeCache {
         let mut shard = self.nodes[hash as usize % SHARD_COUNT]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if shard.capacity() == 0 {
+            *shard = HashMap::with_capacity_and_hasher(
+                NODE_CAPACITY_PER_SHARD,
+                BuildHasherDefault::default(),
+            );
+        }
         if let Some((cached, ())) = shard.raw_entry().from_hash(hash, |cached| cached.0 == node) {
             return cached.0.clone();
         }
@@ -136,6 +142,12 @@ impl SharedNodeCache {
         let mut shard = self.tokens[hash as usize % SHARD_COUNT]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if shard.capacity() == 0 {
+            *shard = HashMap::with_capacity_and_hasher(
+                TOKEN_CAPACITY_PER_SHARD,
+                BuildHasherDefault::default(),
+            );
+        }
         if let Some((cached, ())) = shard.raw_entry().from_hash(hash, |cached| cached.0 == token) {
             return cached.0.clone();
         }
@@ -306,5 +318,15 @@ mod tests {
 
         assert!(!std::ptr::eq::<GreenNodeData>(&*first, &*second));
         assert!(std::ptr::eq::<GreenNodeData>(&*second, &*repeated));
+    }
+
+    #[test]
+    fn shared_cache_reserves_bounded_shards_on_first_use() {
+        let cache = SharedNodeCache::default();
+        cache.insert_node(0, GreenNode::new(SyntaxKind(1), []));
+        cache.insert_token(0, GreenToken::new(SyntaxKind(1), "x"));
+
+        assert!(cache.nodes[0].lock().unwrap().capacity() >= NODE_CAPACITY_PER_SHARD);
+        assert!(cache.tokens[0].lock().unwrap().capacity() >= TOKEN_CAPACITY_PER_SHARD);
     }
 }
