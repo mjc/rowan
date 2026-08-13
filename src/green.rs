@@ -6,7 +6,7 @@ mod node_cache;
 
 use self::element::GreenElement;
 
-pub(crate) use self::{element::GreenElementRef, node::GreenChild};
+pub(crate) use self::element::GreenElementRef;
 
 pub use self::{
     builder::{Checkpoint, GreenNodeBuilder},
@@ -26,9 +26,9 @@ mod tests {
         hash::{Hash, Hasher},
     };
 
-    use super::node::{GreenChild, GreenNodeHead};
+    use super::node::GreenChild;
     use super::*;
-    use crate::{arc::HeaderSlice, TextRange, TextSize};
+    use crate::{TextRange, TextSize};
 
     #[test]
     fn assert_send_sync() {
@@ -45,10 +45,8 @@ mod tests {
         eprintln!("GreenNode          {}", size_of::<GreenNode>());
         eprintln!("GreenToken         {}", size_of::<GreenToken>());
         eprintln!("GreenElement       {}", size_of::<GreenElement>());
-        #[cfg(target_pointer_width = "64")]
-        assert_eq!(size_of::<GreenChild>(), 12);
-        #[cfg(target_pointer_width = "64")]
-        assert_eq!(size_of::<HeaderSlice<GreenNodeHead, [GreenChild; 0]>>(), 12);
+        assert_eq!(size_of::<GreenNode>(), size_of::<usize>());
+        assert_eq!(size_of::<GreenChild>(), size_of::<usize>());
     }
 
     #[test]
@@ -112,5 +110,91 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn checkpointed_children_keep_offsets() {
+        let kind = SyntaxKind(0);
+        let node = GreenNode::new(kind, (0..17).map(|_| GreenToken::new(kind, "x").into()));
+
+        for index in [0, 7, 8, 15, 16] {
+            assert_eq!(node.child_offset(index), (index as u32).into());
+            assert_eq!(
+                node.child_at_range(TextRange::new(
+                    (index as u32).into(),
+                    (index as u32 + 1).into(),
+                ))
+                .unwrap()
+                .0,
+                index,
+            );
+        }
+        assert_eq!(node.child_at_range(TextRange::empty(8.into())).unwrap().0, 7);
+        assert_eq!(node.child_at_range(TextRange::empty(16.into())).unwrap().0, 15);
+        assert!(node.child_at_range(TextRange::new(7.into(), 9.into())).is_none());
+
+        let reverse_offsets =
+            node.children_with_offsets().rev().map(|child| child.rel_offset).collect::<Vec<_>>();
+        assert_eq!(reverse_offsets.first().copied(), Some(16.into()));
+        assert_eq!(reverse_offsets.last().copied(), Some(0.into()));
+
+        let clone = node.clone();
+        drop(node);
+        assert_eq!(clone.to_string(), "xxxxxxxxxxxxxxxxx");
+    }
+
+    #[test]
+    fn checkpointed_children_preserve_empty_range_ordering() {
+        let kind = SyntaxKind(0);
+        let empty = || GreenNode::new(kind, []).into();
+        let node = GreenNode::new(
+            kind,
+            [
+                GreenToken::new(kind, "a").into(),
+                empty(),
+                empty(),
+                empty(),
+                empty(),
+                empty(),
+                GreenToken::new(kind, "b").into(),
+            ],
+        );
+
+        assert_eq!(node.child_at_range(TextRange::empty(1.into())).unwrap().0, 5);
+        assert_eq!(node.child_at_range(TextRange::new(1.into(), 2.into())).unwrap().0, 6);
+    }
+
+    #[test]
+    fn construction_cleans_up_after_iterator_panic() {
+        struct PanicAfterOne {
+            child: Option<GreenElement>,
+        }
+
+        impl Iterator for PanicAfterOne {
+            type Item = GreenElement;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                self.child.take().or_else(|| panic!("iterator panic"))
+            }
+
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                let len = self.len();
+                (len, Some(len))
+            }
+        }
+
+        impl ExactSizeIterator for PanicAfterOne {
+            fn len(&self) -> usize {
+                if self.child.is_some() {
+                    2
+                } else {
+                    1
+                }
+            }
+        }
+
+        let kind = SyntaxKind(0);
+        let children = PanicAfterOne { child: Some(GreenToken::new(kind, "child").into()) };
+        assert!(std::panic::catch_unwind(|| GreenNode::new(kind, children)).is_err());
     }
 }

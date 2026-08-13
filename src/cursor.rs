@@ -38,14 +38,14 @@ use std::{
     iter,
     mem::ManuallyDrop,
     num::NonZeroU32,
-    ptr, slice,
+    ptr,
     sync::atomic::{AtomicU32, Ordering},
 };
 
 use countme::Count;
 
 use crate::{
-    green::{GreenChild, GreenElementRef, GreenNodeData, GreenTokenData, SyntaxKind},
+    green::{GreenElementRef, GreenNodeData, GreenTokenData, SyntaxKind},
     Direction, GreenNode, GreenToken, NodeOrToken, SyntaxText, TextRange, TextSize, TokenAtOffset,
     WalkEvent,
 };
@@ -226,14 +226,14 @@ impl NodeData {
         }
     }
     #[inline]
-    fn green_siblings(&self) -> slice::Iter<'_, GreenChild> {
+    fn green_parent(&self) -> Option<&GreenNodeData> {
         match &self.parent().map(|it| &it.green) {
-            Some(Green::Node { ptr }) => unsafe { &*ptr.as_ptr() }.children().raw,
+            Some(Green::Node { ptr }) => Some(unsafe { &*ptr.as_ptr() }),
             Some(Green::Token { .. }) => {
                 debug_assert!(false);
-                [].iter()
+                None
             }
-            None => [].iter(),
+            None => None,
         }
     }
     #[inline]
@@ -259,51 +259,45 @@ impl NodeData {
     }
 
     fn next_sibling(&self) -> Option<SyntaxNode> {
-        let mut siblings = self.green_siblings().enumerate();
-        let index = self.index() as usize;
-
-        siblings.nth(index);
-        siblings.find_map(|(index, child)| {
-            child.as_ref().into_node().and_then(|green| {
+        let siblings = self.green_parent()?;
+        (self.index() as usize + 1..siblings.child_count()).find_map(|index| {
+            let child = siblings.child_with_offset(index);
+            child.element.into_node().and_then(|green| {
                 let parent = self.parent_node()?;
-                let offset = parent.offset() + child.rel_offset();
+                let offset = parent.offset() + child.rel_offset;
                 Some(SyntaxNode::new_child(green, parent, index as u32, offset))
             })
         })
     }
     fn prev_sibling(&self) -> Option<SyntaxNode> {
-        let mut rev_siblings = self.green_siblings().enumerate().rev();
-        let index = rev_siblings.len().checked_sub(self.index() as usize + 1)?;
-
-        rev_siblings.nth(index);
-        rev_siblings.find_map(|(index, child)| {
-            child.as_ref().into_node().and_then(|green| {
+        let siblings = self.green_parent()?;
+        (0..self.index() as usize).rev().find_map(|index| {
+            let child = siblings.child_with_offset(index);
+            child.element.into_node().and_then(|green| {
                 let parent = self.parent_node()?;
-                let offset = parent.offset() + child.rel_offset();
+                let offset = parent.offset() + child.rel_offset;
                 Some(SyntaxNode::new_child(green, parent, index as u32, offset))
             })
         })
     }
 
     fn next_sibling_or_token(&self) -> Option<SyntaxElement> {
-        let mut siblings = self.green_siblings().enumerate();
         let index = self.index() as usize + 1;
-
-        siblings.nth(index).and_then(|(index, child)| {
-            let parent = self.parent_node()?;
-            let offset = parent.offset() + child.rel_offset();
-            Some(SyntaxElement::new(child.as_ref(), parent, index as u32, offset))
-        })
+        let siblings = self.green_parent()?;
+        if index == siblings.child_count() {
+            return None;
+        }
+        let child = siblings.child_with_offset(index);
+        let parent = self.parent_node()?;
+        let offset = parent.offset() + child.rel_offset;
+        Some(SyntaxElement::new(child.element, parent, index as u32, offset))
     }
     fn prev_sibling_or_token(&self) -> Option<SyntaxElement> {
-        let mut siblings = self.green_siblings().enumerate();
         let index = self.index().checked_sub(1)? as usize;
-
-        siblings.nth(index).and_then(|(index, child)| {
-            let parent = self.parent_node()?;
-            let offset = parent.offset() + child.rel_offset();
-            Some(SyntaxElement::new(child.as_ref(), parent, index as u32, offset))
-        })
+        let child = self.green_parent()?.child_with_offset(index);
+        let parent = self.parent_node()?;
+        let offset = parent.offset() + child.rel_offset;
+        Some(SyntaxElement::new(child.element, parent, index as u32, offset))
     }
 }
 
@@ -444,7 +438,9 @@ impl SyntaxNode {
     }
 
     pub fn first_child(&self) -> Option<SyntaxNode> {
-        self.green_ref().children().raw.enumerate().find_map(|(index, child)| {
+        let parent = self.green_ref();
+        (0..parent.child_count()).find_map(|index| {
+            let child = parent.child_with_offset(index);
             child.as_ref().into_node().map(|green| {
                 SyntaxNode::new_child(
                     green,
@@ -456,7 +452,9 @@ impl SyntaxNode {
         })
     }
     pub fn last_child(&self) -> Option<SyntaxNode> {
-        self.green_ref().children().raw.enumerate().rev().find_map(|(index, child)| {
+        let parent = self.green_ref();
+        (0..parent.child_count()).rev().find_map(|index| {
+            let child = parent.child_with_offset(index);
             child.as_ref().into_node().map(|green| {
                 SyntaxNode::new_child(
                     green,
@@ -469,19 +467,28 @@ impl SyntaxNode {
     }
 
     pub fn first_child_or_token(&self) -> Option<SyntaxElement> {
-        self.green_ref().children().raw.next().map(|child| {
-            SyntaxElement::new(child.as_ref(), self.clone(), 0, self.offset() + child.rel_offset())
-        })
+        let parent = self.green_ref();
+        if parent.child_count() == 0 {
+            return None;
+        }
+        let child = parent.child_with_offset(0);
+        Some(SyntaxElement::new(
+            child.as_ref(),
+            self.clone(),
+            0,
+            self.offset() + child.rel_offset(),
+        ))
     }
     pub fn last_child_or_token(&self) -> Option<SyntaxElement> {
-        self.green_ref().children().raw.enumerate().next_back().map(|(index, child)| {
-            SyntaxElement::new(
-                child.as_ref(),
-                self.clone(),
-                index as u32,
-                self.offset() + child.rel_offset(),
-            )
-        })
+        let parent = self.green_ref();
+        let index = parent.child_count().checked_sub(1)?;
+        let child = parent.child_with_offset(index);
+        Some(SyntaxElement::new(
+            child.as_ref(),
+            self.clone(),
+            index as u32,
+            self.offset() + child.rel_offset(),
+        ))
     }
 
     pub fn next_sibling(&self) -> Option<SyntaxNode> {
@@ -929,7 +936,11 @@ impl SyntaxNodeChildren {
         loop {
             let index = self.next_index;
             self.next_index += 1;
-            let child = self.parent.green_ref().child_at(index)?;
+            let parent = self.parent.green_ref();
+            if index == parent.child_count() {
+                return None;
+            }
+            let child = parent.child_with_offset(index);
             let Some(green) = child.as_ref().into_node() else { continue };
             if predicate(green.kind()) {
                 return Some(SyntaxNode::new_child(
