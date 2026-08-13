@@ -27,6 +27,8 @@ mod tests {
     };
 
     use super::node::GreenChild;
+    #[cfg(target_pointer_width = "64")]
+    use super::node::{allocation_layout, PackedGreenChild};
     use super::*;
     use crate::{TextRange, TextSize};
 
@@ -49,6 +51,12 @@ mod tests {
         #[cfg(target_pointer_width = "64")]
         assert_eq!(size_of::<GreenNodeData>(), size_of::<u32>());
         assert_eq!(size_of::<GreenChild>(), size_of::<usize>());
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(size_of::<PackedGreenChild>(), size_of::<u32>());
+            assert_eq!(allocation_layout(1, false).size(), 12);
+            assert_eq!(allocation_layout(2, false).size(), 16);
+        }
     }
 
     #[test]
@@ -66,6 +74,8 @@ mod tests {
         assert_eq!(node.child_offset(0), TextSize::new(0));
         assert_eq!(node.child_offset(1), TextSize::new(1));
         assert_eq!(node.child_offset(2), TextSize::new(3));
+        assert_eq!(node.child(0).unwrap().kind(), kind);
+        assert!(node.child(3).is_none());
         assert_eq!(node.child_at_range(TextRange::new(1.into(), 3.into())).unwrap().0, 1);
 
         let clone = node.clone();
