@@ -563,10 +563,27 @@ unsafe impl Send for GreenChild {}
 // SAFETY: `GreenChild` owns an immutable `GreenNode` or `GreenToken`, both Send and Sync.
 unsafe impl Sync for GreenChild {}
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy)]
 pub(crate) struct GreenChildRef<'a> {
     pub(crate) element: GreenElementRef<'a>,
     pub(crate) rel_offset: TextSize,
+}
+
+impl PartialEq for GreenChildRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.rel_offset != other.rel_offset {
+            return false;
+        }
+        match (self.element, other.element) {
+            (NodeOrToken::Node(left), NodeOrToken::Node(right)) => {
+                ptr::eq(left, right) || left == right
+            }
+            (NodeOrToken::Token(left), NodeOrToken::Token(right)) => {
+                ptr::eq(left, right) || left == right
+            }
+            _ => false,
+        }
+    }
 }
 
 impl<'a> GreenChildRef<'a> {
