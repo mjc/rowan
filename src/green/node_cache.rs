@@ -92,9 +92,18 @@ impl SharedNodeCache {
         &self,
         hash: u64,
         kind: SyntaxKind,
-        children: &mut Vec<(u64, u64, GreenElement)>,
-        first_child: usize,
-    ) -> GreenNode {
+        children: &[(u64, u64, GreenElement)],
+    ) -> Option<GreenNode> {
+        let shard = self.nodes[hash as usize % SHARD_COUNT]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        shard
+            .raw_entry()
+            .from_hash(hash, |cached| node_matches(&cached.0, kind, children))
+            .map(|(cached, ())| cached.0.clone())
+    }
+
+    fn insert_node(&self, hash: u64, node: GreenNode) -> GreenNode {
         let mut shard = self.nodes[hash as usize % SHARD_COUNT]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -104,38 +113,32 @@ impl SharedNodeCache {
                 BuildHasherDefault::default(),
             );
         }
+        if let Some((cached, ())) = shard.raw_entry().from_hash(hash, |cached| cached.0 == node) {
+            return cached.0.clone();
+        }
         if shard.len() >= NODE_CAPACITY_PER_SHARD {
-            if let Some((cached, ())) = shard
-                .raw_entry()
-                .from_hash(hash, |cached| node_matches(&cached.0, kind, &children[first_child..]))
-            {
-                drop(children.drain(first_child..));
-                return cached.0.clone();
-            }
             shard.clear();
         }
-        match shard
-            .raw_entry_mut()
-            .from_hash(hash, |cached| node_matches(&cached.0, kind, &children[first_child..]))
-        {
-            RawEntryMut::Occupied(entry) => {
-                drop(children.drain(first_child..));
-                entry.key().0.clone()
-            }
-            RawEntryMut::Vacant(entry) => {
-                let node = GreenNode::new(
-                    kind,
-                    children.drain(first_child..).map(|(_, _, element)| element),
-                );
-                entry.insert_with_hasher(hash, NoHash(node.clone()), (), |cached| {
-                    node_hash(&cached.0)
-                });
-                node
-            }
-        }
+        let RawEntryMut::Vacant(entry) =
+            shard.raw_entry_mut().from_hash(hash, |cached| cached.0 == node)
+        else {
+            unreachable!()
+        };
+        entry.insert_with_hasher(hash, NoHash(node.clone()), (), |cached| node_hash(&cached.0));
+        node
     }
 
-    fn token(&self, hash: u64, kind: SyntaxKind, text: &str) -> GreenToken {
+    fn token(&self, hash: u64, kind: SyntaxKind, text: &str) -> Option<GreenToken> {
+        let shard = self.tokens[hash as usize % SHARD_COUNT]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        shard
+            .raw_entry()
+            .from_hash(hash, |cached| cached.0.kind() == kind && cached.0.text() == text)
+            .map(|(cached, ())| cached.0.clone())
+    }
+
+    fn insert_token(&self, hash: u64, token: GreenToken) -> GreenToken {
         let mut shard = self.tokens[hash as usize % SHARD_COUNT]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -145,28 +148,19 @@ impl SharedNodeCache {
                 BuildHasherDefault::default(),
             );
         }
+        if let Some((cached, ())) = shard.raw_entry().from_hash(hash, |cached| cached.0 == token) {
+            return cached.0.clone();
+        }
         if shard.len() >= TOKEN_CAPACITY_PER_SHARD {
-            if let Some((cached, ())) = shard
-                .raw_entry()
-                .from_hash(hash, |cached| cached.0.kind() == kind && cached.0.text() == text)
-            {
-                return cached.0.clone();
-            }
             shard.clear();
         }
-        match shard
-            .raw_entry_mut()
-            .from_hash(hash, |cached| cached.0.kind() == kind && cached.0.text() == text)
-        {
-            RawEntryMut::Occupied(entry) => entry.key().0.clone(),
-            RawEntryMut::Vacant(entry) => {
-                let token = GreenToken::new(kind, text);
-                entry.insert_with_hasher(hash, NoHash(token.clone()), (), |cached| {
-                    token_hash(&cached.0)
-                });
-                token
-            }
-        }
+        let RawEntryMut::Vacant(entry) =
+            shard.raw_entry_mut().from_hash(hash, |cached| cached.0 == token)
+        else {
+            unreachable!()
+        };
+        entry.insert_with_hasher(hash, NoHash(token.clone()), (), |cached| token_hash(&cached.0));
+        token
     }
 }
 
@@ -215,7 +209,11 @@ impl NodeCache {
             if children_ref.len() > MAX_SHARED_NODE_CHILDREN {
                 return (0, structural_hash, build_node(children));
             }
-            let node = cache.node(structural_hash, kind, children, first_child);
+            if let Some(node) = cache.node(structural_hash, kind, children_ref) {
+                drop(children.drain(first_child..));
+                return (0, structural_hash, node);
+            }
+            let node = cache.insert_node(structural_hash, build_node(children));
             return (0, structural_hash, node);
         }
 
@@ -277,7 +275,9 @@ impl NodeCache {
             if text.len() > MAX_SHARED_TOKEN_LEN {
                 return (hash, GreenToken::new(kind, text));
             }
-            let token = cache.token(hash, kind, text);
+            let token = cache
+                .token(hash, kind, text)
+                .unwrap_or_else(|| cache.insert_token(hash, GreenToken::new(kind, text)));
             return (hash, token);
         }
 
@@ -312,10 +312,9 @@ mod tests {
     #[test]
     fn shared_cache_checks_equality_after_hash_match() {
         let cache = SharedNodeCache::default();
-        let mut children = Vec::new();
-        let first = cache.node(0, SyntaxKind(1), &mut children, 0);
-        let second = cache.node(0, SyntaxKind(2), &mut children, 0);
-        let repeated = cache.node(0, SyntaxKind(2), &mut children, 0);
+        let first = cache.insert_node(0, GreenNode::new(SyntaxKind(1), []));
+        let second = cache.insert_node(0, GreenNode::new(SyntaxKind(2), []));
+        let repeated = cache.insert_node(0, GreenNode::new(SyntaxKind(2), []));
 
         assert!(!std::ptr::eq::<GreenNodeData>(&*first, &*second));
         assert!(std::ptr::eq::<GreenNodeData>(&*second, &*repeated));
@@ -324,8 +323,8 @@ mod tests {
     #[test]
     fn shared_cache_reserves_bounded_shards_on_first_use() {
         let cache = SharedNodeCache::default();
-        cache.node(0, SyntaxKind(1), &mut Vec::new(), 0);
-        cache.token(0, SyntaxKind(1), "x");
+        cache.insert_node(0, GreenNode::new(SyntaxKind(1), []));
+        cache.insert_token(0, GreenToken::new(SyntaxKind(1), "x"));
 
         assert!(cache.nodes[0].lock().unwrap().capacity() >= NODE_CAPACITY_PER_SHARD);
         assert!(cache.tokens[0].lock().unwrap().capacity() >= TOKEN_CAPACITY_PER_SHARD);
