@@ -937,7 +937,7 @@ impl SyntaxNodeChildren {
             let index = self.next_index;
             self.next_index += 1;
             let parent = self.parent.green_ref();
-            if index == parent.child_count() {
+            if index >= parent.child_count() {
                 return None;
             }
             let child = parent.child_with_offset(index);
@@ -1120,6 +1120,17 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first.first_token(), second.first_token());
+    }
+
+    #[test]
+    fn exhausted_node_children_stay_exhausted() {
+        let kind = SyntaxKind(0);
+        let root =
+            SyntaxNode::new_root(GreenNode::new(kind, [GreenToken::new(kind, "token").into()]));
+        let mut children = root.children();
+
+        assert_eq!(children.next(), None);
+        assert_eq!(children.next(), None);
     }
 }
 // endregion
