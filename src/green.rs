@@ -46,7 +46,8 @@ mod tests {
         eprintln!("GreenToken         {}", size_of::<GreenToken>());
         eprintln!("GreenElement       {}", size_of::<GreenElement>());
         assert_eq!(size_of::<GreenNode>(), size_of::<usize>());
-        assert_eq!(size_of::<GreenNodeData>(), size_of::<usize>());
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(size_of::<GreenNodeData>(), size_of::<u32>());
         assert_eq!(size_of::<GreenChild>(), size_of::<usize>());
     }
 
@@ -211,5 +212,28 @@ mod tests {
         assert_eq!(cloned.children().len(), child_count);
         assert_eq!(cloned.text_len(), (child_count as u32).into());
         assert_eq!(cloned.child_offset(child_count - 1), ((child_count - 1) as u32).into());
+    }
+
+    #[test]
+    fn text_only_wide_headers_preserve_full_text_lengths() {
+        let kind = SyntaxKind(1);
+        let text = "x".repeat(1 << 14);
+        let token = GreenToken::new(SyntaxKind(u16::MAX), &text);
+        let node = GreenNode::new(kind, [token.into()]);
+        let cloned = node.clone();
+        drop(node);
+
+        assert_eq!(cloned.kind(), kind);
+        assert_eq!(cloned.text_len(), (text.len() as u32).into());
+        assert_eq!(cloned.children().next().unwrap().kind(), SyntaxKind(u16::MAX));
+    }
+
+    #[test]
+    fn kind_only_wide_headers_preserve_full_kinds() {
+        let kind = SyntaxKind(u16::MAX);
+        let node = GreenNode::new(kind, [GreenToken::new(SyntaxKind(1), "x").into()]);
+
+        assert_eq!(node.kind(), kind);
+        assert_eq!(node.text_len(), 1.into());
     }
 }
