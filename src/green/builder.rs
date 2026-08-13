@@ -175,4 +175,24 @@ mod tests {
         assert!(!std::ptr::eq::<crate::GreenNodeData>(&*first, &*second));
         assert_eq!(first, second);
     }
+
+    #[test]
+    fn shared_cache_does_not_propagate_through_compound_nodes() {
+        fn build(cache: &SharedNodeCache) -> GreenNode {
+            let mut builder = GreenNodeBuilder::with_shared_cache(cache);
+            builder.start_node(SyntaxKind(0));
+            builder.start_node(SyntaxKind(1));
+            builder.token(SyntaxKind(2), "one");
+            builder.token(SyntaxKind(2), "two");
+            builder.finish_node();
+            builder.finish_node();
+            builder.finish()
+        }
+
+        let cache = SharedNodeCache::default();
+        let first = build(&cache);
+        let second = build(&cache);
+
+        assert!(!std::ptr::eq::<crate::GreenNodeData>(&*first, &*second));
+    }
 }

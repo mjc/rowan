@@ -190,6 +190,12 @@ impl NodeCache {
         };
 
         let children_ref = &children[first_child..];
+        if shared_cache.is_some()
+            && (children_ref.len() > MAX_SHARED_NODE_CHILDREN
+                || children_ref.iter().any(|&(_, hash, _)| hash == 0))
+        {
+            return (0, 0, build_node(children));
+        }
         let structural_hash = {
             let mut h = FxHasher::default();
             kind.hash(&mut h);
@@ -200,9 +206,6 @@ impl NodeCache {
         };
 
         if let Some(cache) = shared_cache {
-            if children_ref.len() > MAX_SHARED_NODE_CHILDREN {
-                return (0, structural_hash, build_node(children));
-            }
             if let Some(node) = cache.node(structural_hash, kind, children_ref) {
                 drop(children.drain(first_child..));
                 return (0, structural_hash, node);
@@ -267,7 +270,7 @@ impl NodeCache {
 
         if let Some(cache) = shared_cache {
             if text.len() > MAX_SHARED_TOKEN_LEN {
-                return (hash, GreenToken::new(kind, text));
+                return (0, GreenToken::new(kind, text));
             }
             let token = cache
                 .token(hash, kind, text)
