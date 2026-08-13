@@ -42,7 +42,7 @@ static_assert!(mem::size_of::<GreenChild>() == 8);
 static_assert!(mem::align_of::<GreenNodeData>() >= 2);
 static_assert!(mem::align_of::<GreenTokenData>() >= 2);
 
-const CHILDREN_PER_CHECKPOINT: usize = 4;
+const CHILDREN_PER_CHECKPOINT: usize = 2;
 const MAX_REFCOUNT: usize = isize::MAX as usize;
 
 #[repr(C)]
