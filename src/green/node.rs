@@ -1,8 +1,10 @@
 use std::{
     borrow::Borrow,
     fmt,
+    hash::{Hash, Hasher},
     iter::{self, FusedIterator},
     mem::{self, ManuallyDrop},
+    num::NonZeroUsize,
     ops, ptr, slice,
 };
 
@@ -12,7 +14,7 @@ use crate::{
     arc::{Arc, HeaderSlice, ThinArc},
     green::{GreenElement, GreenElementRef, SyntaxKind},
     utility_types::static_assert,
-    GreenToken, NodeOrToken, TextRange, TextSize,
+    GreenToken, GreenTokenData, NodeOrToken, TextRange, TextSize,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -22,13 +24,19 @@ pub(super) struct GreenNodeHead {
     _c: Count<GreenNode>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum GreenChild {
-    Node { rel_offset: TextSize, node: GreenNode },
-    Token { rel_offset: TextSize, token: GreenToken },
+/// An owning node-or-token pointer and its offset.
+///
+/// The pointer's low bit distinguishes tokens from nodes. Four-byte packing keeps the offset from
+/// adding pointer-alignment padding.
+#[repr(C, packed(4))]
+pub(crate) struct GreenChild {
+    ptr: ptr::NonNull<()>,
+    rel_offset: TextSize,
 }
 #[cfg(target_pointer_width = "64")]
-static_assert!(mem::size_of::<GreenChild>() == mem::size_of::<usize>() * 2);
+static_assert!(mem::size_of::<GreenChild>() == 12);
+static_assert!(mem::align_of::<GreenNodeData>() >= 2);
+static_assert!(mem::align_of::<GreenTokenData>() >= 2);
 
 type Repr = HeaderSlice<GreenNodeHead, [GreenChild]>;
 type ReprThin = HeaderSlice<GreenNodeHead, [GreenChild; 0]>;
@@ -138,6 +146,11 @@ impl GreenNodeData {
         self.slice().get(index)
     }
 
+    #[cfg(test)]
+    pub(crate) fn child_offset(&self, index: usize) -> TextSize {
+        self.slice()[index].rel_offset()
+    }
+
     pub(crate) fn child_at_range(
         &self,
         rel_range: TextRange,
@@ -212,10 +225,7 @@ impl GreenNode {
         let children = children.into_iter().map(|el| {
             let rel_offset = text_len;
             text_len += el.text_len();
-            match el {
-                NodeOrToken::Node(node) => GreenChild::Node { rel_offset, node },
-                NodeOrToken::Token(token) => GreenChild::Token { rel_offset, token },
-            }
+            GreenChild::from_element(el, rel_offset)
         });
 
         let data = ThinArc::from_header_and_iter(
@@ -250,27 +260,138 @@ impl GreenNode {
 }
 
 impl GreenChild {
+    const TOKEN_TAG: usize = 1;
+
+    fn from_node(node: GreenNode, rel_offset: TextSize) -> GreenChild {
+        let ptr = GreenNode::into_raw(node).cast();
+        debug_assert_eq!(ptr.addr().get() & Self::TOKEN_TAG, 0);
+        GreenChild { ptr, rel_offset }
+    }
+
+    fn from_token(token: GreenToken, rel_offset: TextSize) -> GreenChild {
+        let ptr = GreenToken::into_raw(token).cast();
+        debug_assert_eq!(ptr.addr().get() & Self::TOKEN_TAG, 0);
+        let ptr = ptr.map_addr(|addr| NonZeroUsize::new(addr.get() | Self::TOKEN_TAG).unwrap());
+        GreenChild { ptr, rel_offset }
+    }
+
+    fn from_element(element: GreenElement, rel_offset: TextSize) -> GreenChild {
+        match element {
+            NodeOrToken::Node(node) => GreenChild::from_node(node, rel_offset),
+            NodeOrToken::Token(token) => GreenChild::from_token(token, rel_offset),
+        }
+    }
+
+    fn ptr(&self) -> ptr::NonNull<()> {
+        // SAFETY: `ptr` is initialized but packed to four-byte alignment.
+        unsafe { ptr::addr_of!(self.ptr).read_unaligned() }
+    }
+
+    fn is_token(ptr: ptr::NonNull<()>) -> bool {
+        ptr.addr().get() & Self::TOKEN_TAG != 0
+    }
+
+    fn untagged<T>(ptr: ptr::NonNull<()>) -> ptr::NonNull<T> {
+        ptr.map_addr(|addr| NonZeroUsize::new(addr.get() & !Self::TOKEN_TAG).unwrap()).cast()
+    }
+
     #[inline]
     pub(crate) fn as_ref(&self) -> GreenElementRef<'_> {
-        match self {
-            GreenChild::Node { node, .. } => NodeOrToken::Node(node),
-            GreenChild::Token { token, .. } => NodeOrToken::Token(token),
+        let ptr = self.ptr();
+        if Self::is_token(ptr) {
+            let ptr = Self::untagged::<GreenTokenData>(ptr);
+            // SAFETY: `from_token` stores one owned token pointer, and `self` keeps it alive.
+            NodeOrToken::Token(unsafe { ptr.as_ref() })
+        } else {
+            let ptr = Self::untagged::<GreenNodeData>(ptr);
+            // SAFETY: `from_node` stores one owned node pointer, and `self` keeps it alive.
+            NodeOrToken::Node(unsafe { ptr.as_ref() })
         }
     }
+
     #[inline]
     pub(crate) fn rel_offset(&self) -> TextSize {
-        match self {
-            GreenChild::Node { rel_offset, .. } | GreenChild::Token { rel_offset, .. } => {
-                *rel_offset
-            }
-        }
+        // SAFETY: `rel_offset` is initialized and naturally aligned by the four-byte packing.
+        unsafe { ptr::addr_of!(self.rel_offset).read_unaligned() }
     }
+
     #[inline]
     fn rel_range(&self) -> TextRange {
         let len = self.as_ref().text_len();
         TextRange::at(self.rel_offset(), len)
     }
 }
+
+impl Clone for GreenChild {
+    fn clone(&self) -> Self {
+        GreenChild::from_element(self.as_ref().to_owned(), self.rel_offset())
+    }
+}
+
+impl Drop for GreenChild {
+    fn drop(&mut self) {
+        let ptr = self.ptr();
+        if Self::is_token(ptr) {
+            // SAFETY: `from_token` transferred exactly one owned token reference into this child.
+            drop(unsafe { GreenToken::from_raw(Self::untagged(ptr)) });
+        } else {
+            // SAFETY: `from_node` transferred exactly one owned node reference into this child.
+            drop(unsafe { GreenNode::from_raw(Self::untagged(ptr)) });
+        }
+    }
+}
+
+impl fmt::Debug for GreenChild {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GreenChild")
+            .field("rel_offset", &self.rel_offset())
+            .field("element", &self.as_ref())
+            .finish()
+    }
+}
+
+impl PartialEq for GreenChild {
+    fn eq(&self, other: &Self) -> bool {
+        self.rel_offset() == other.rel_offset()
+            && (self.ptr() == other.ptr() || self.as_ref() == other.as_ref())
+    }
+}
+
+impl Eq for GreenChild {}
+
+impl Hash for GreenChild {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        fn hash_element<H: Hasher>(
+            element: GreenElementRef<'_>,
+            rel_offset: TextSize,
+            state: &mut H,
+        ) {
+            rel_offset.hash(state);
+            match element {
+                NodeOrToken::Node(node) => {
+                    false.hash(state);
+                    node.kind().hash(state);
+                    node.text_len().hash(state);
+                    for child in node.slice() {
+                        hash_element(child.as_ref(), child.rel_offset(), state);
+                    }
+                }
+                NodeOrToken::Token(token) => {
+                    true.hash(state);
+                    token.kind().hash(state);
+                    token.text().hash(state);
+                }
+            }
+        }
+
+        hash_element(self.as_ref(), self.rel_offset(), state);
+    }
+}
+
+// SAFETY: `GreenChild` owns an immutable `GreenNode` or `GreenToken`, both Send and Sync.
+unsafe impl Send for GreenChild {}
+// SAFETY: `GreenChild` owns an immutable `GreenNode` or `GreenToken`, both Send and Sync.
+unsafe impl Sync for GreenChild {}
 
 #[derive(Debug, Clone)]
 pub struct Children<'a> {
