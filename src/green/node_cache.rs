@@ -10,8 +10,52 @@ use crate::{GreenNode, GreenNodeData, GreenToken, GreenTokenData, NodeOrToken, S
 use super::element::GreenElement;
 
 type HashMap<K, V> = hashbrown::HashMap<K, V, BuildHasherDefault<FxHasher>>;
-type NodeShard = Mutex<HashMap<NoHash<GreenNode>, ()>>;
-type TokenShard = Mutex<HashMap<NoHash<GreenToken>, ()>>;
+type SharedSlot<T> = [Option<T>; 2];
+type NodeShard = Mutex<SharedShard<GreenNode>>;
+type TokenShard = Mutex<SharedShard<GreenToken>>;
+
+#[derive(Debug)]
+struct SharedShard<T> {
+    slots: Box<[SharedSlot<T>]>,
+}
+
+impl<T> Default for SharedShard<T> {
+    fn default() -> Self {
+        SharedShard { slots: Box::new([]) }
+    }
+}
+
+impl<T: Clone + PartialEq> SharedShard<T> {
+    #[cfg(test)]
+    fn slot_count(&self) -> usize {
+        self.slots.len() * 2
+    }
+
+    fn get(&self, hash: u64, mut matches: impl FnMut(&T) -> bool) -> Option<&T> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        self.slots[self.set_index(hash)].iter().flatten().find(|value| matches(value))
+    }
+
+    fn insert(&mut self, hash: u64, value: T, capacity: usize) -> T {
+        if self.slots.is_empty() {
+            self.slots = (0..capacity.div_ceil(2)).map(|_| [None, None]).collect::<Box<[_]>>();
+        }
+        let index = self.set_index(hash);
+        if let Some(cached) = self.slots[index].iter().flatten().find(|it| *it == &value) {
+            return cached.clone();
+        }
+        let way =
+            self.slots[index].iter().position(Option::is_none).unwrap_or((hash >> 32) as usize % 2);
+        self.slots[index][way] = Some(value.clone());
+        value
+    }
+
+    fn set_index(&self, hash: u64) -> usize {
+        (hash >> 8) as usize % self.slots.len()
+    }
+}
 
 #[derive(Debug)]
 struct NoHash<T>(T);
@@ -24,7 +68,6 @@ pub struct NodeCache {
 }
 
 const SHARD_COUNT: usize = 256;
-// Clear at hashbrown's 7/8 load limit for 16K buckets instead of resizing to 32K.
 const NODE_CAPACITY_PER_SHARD: usize = 14 * 1024;
 const TOKEN_CAPACITY_PER_SHARD: usize = 4 * 1024;
 const MAX_SHARED_NODE_CHILDREN: usize = 1;
@@ -32,8 +75,8 @@ const MAX_SHARED_TOKEN_LEN: usize = 8;
 
 /// A bounded, thread-safe interner for sharing immutable green trees across builders.
 ///
-/// Individual shards are cleared at their capacity so unused trees cannot accumulate without
-/// bound. Hash matches are confirmed with structural equality before a tree is reused.
+/// Individual shards use bounded two-way slots. A full slot overwrites one colliding entry, and
+/// hash matches are confirmed with structural equality before a tree is reused.
 #[derive(Debug)]
 pub struct SharedNodeCache {
     nodes: Box<[NodeShard]>,
@@ -42,8 +85,8 @@ pub struct SharedNodeCache {
 
 impl Default for SharedNodeCache {
     fn default() -> Self {
-        let nodes = (0..SHARD_COUNT).map(|_| Mutex::new(HashMap::default())).collect();
-        let tokens = (0..SHARD_COUNT).map(|_| Mutex::new(HashMap::default())).collect();
+        let nodes = (0..SHARD_COUNT).map(|_| Mutex::new(SharedShard::default())).collect();
+        let tokens = (0..SHARD_COUNT).map(|_| Mutex::new(SharedShard::default())).collect();
         SharedNodeCache { nodes, tokens }
     }
 }
@@ -81,10 +124,10 @@ impl SharedNodeCache {
     /// Green trees already returned by builders remain valid.
     pub fn clear(&self) {
         for shard in &self.nodes {
-            *shard.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = HashMap::default();
+            *shard.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = SharedShard::default();
         }
         for shard in &self.tokens {
-            *shard.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = HashMap::default();
+            *shard.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = SharedShard::default();
         }
     }
 
@@ -97,70 +140,28 @@ impl SharedNodeCache {
         let shard = self.nodes[hash as usize % SHARD_COUNT]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        shard
-            .raw_entry()
-            .from_hash(hash, |cached| node_matches(&cached.0, kind, children))
-            .map(|(cached, ())| cached.0.clone())
+        shard.get(hash, |cached| node_matches(cached, kind, children)).cloned()
     }
 
     fn insert_node(&self, hash: u64, node: GreenNode) -> GreenNode {
         let mut shard = self.nodes[hash as usize % SHARD_COUNT]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if shard.capacity() == 0 {
-            *shard = HashMap::with_capacity_and_hasher(
-                NODE_CAPACITY_PER_SHARD,
-                BuildHasherDefault::default(),
-            );
-        }
-        if let Some((cached, ())) = shard.raw_entry().from_hash(hash, |cached| cached.0 == node) {
-            return cached.0.clone();
-        }
-        if shard.len() >= NODE_CAPACITY_PER_SHARD {
-            shard.clear();
-        }
-        let RawEntryMut::Vacant(entry) =
-            shard.raw_entry_mut().from_hash(hash, |cached| cached.0 == node)
-        else {
-            unreachable!()
-        };
-        entry.insert_with_hasher(hash, NoHash(node.clone()), (), |cached| node_hash(&cached.0));
-        node
+        shard.insert(hash, node, NODE_CAPACITY_PER_SHARD)
     }
 
     fn token(&self, hash: u64, kind: SyntaxKind, text: &str) -> Option<GreenToken> {
         let shard = self.tokens[hash as usize % SHARD_COUNT]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        shard
-            .raw_entry()
-            .from_hash(hash, |cached| cached.0.kind() == kind && cached.0.text() == text)
-            .map(|(cached, ())| cached.0.clone())
+        shard.get(hash, |cached| cached.kind() == kind && cached.text() == text).cloned()
     }
 
     fn insert_token(&self, hash: u64, token: GreenToken) -> GreenToken {
         let mut shard = self.tokens[hash as usize % SHARD_COUNT]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if shard.capacity() == 0 {
-            *shard = HashMap::with_capacity_and_hasher(
-                TOKEN_CAPACITY_PER_SHARD,
-                BuildHasherDefault::default(),
-            );
-        }
-        if let Some((cached, ())) = shard.raw_entry().from_hash(hash, |cached| cached.0 == token) {
-            return cached.0.clone();
-        }
-        if shard.len() >= TOKEN_CAPACITY_PER_SHARD {
-            shard.clear();
-        }
-        let RawEntryMut::Vacant(entry) =
-            shard.raw_entry_mut().from_hash(hash, |cached| cached.0 == token)
-        else {
-            unreachable!()
-        };
-        entry.insert_with_hasher(hash, NoHash(token.clone()), (), |cached| token_hash(&cached.0));
-        token
+        shard.insert(hash, token, TOKEN_CAPACITY_PER_SHARD)
     }
 }
 
@@ -321,9 +322,11 @@ mod tests {
         let first = cache.insert_node(0, GreenNode::new(SyntaxKind(1), []));
         let second = cache.insert_node(0, GreenNode::new(SyntaxKind(2), []));
         let repeated = cache.insert_node(0, GreenNode::new(SyntaxKind(2), []));
+        let repeated_first = cache.insert_node(0, GreenNode::new(SyntaxKind(1), []));
 
         assert!(!std::ptr::eq::<GreenNodeData>(&*first, &*second));
         assert!(std::ptr::eq::<GreenNodeData>(&*second, &*repeated));
+        assert!(std::ptr::eq::<GreenNodeData>(&*first, &*repeated_first));
     }
 
     #[test]
@@ -332,7 +335,11 @@ mod tests {
         cache.insert_node(0, GreenNode::new(SyntaxKind(1), []));
         cache.insert_token(0, GreenToken::new(SyntaxKind(1), "x"));
 
-        assert!(cache.nodes[0].lock().unwrap().capacity() >= NODE_CAPACITY_PER_SHARD);
-        assert!(cache.tokens[0].lock().unwrap().capacity() >= TOKEN_CAPACITY_PER_SHARD);
+        assert_eq!(cache.nodes[0].lock().unwrap().slot_count(), NODE_CAPACITY_PER_SHARD);
+        assert_eq!(cache.tokens[0].lock().unwrap().slot_count(), TOKEN_CAPACITY_PER_SHARD);
+        assert_eq!(
+            std::mem::size_of::<SharedSlot<GreenNode>>(),
+            2 * std::mem::size_of::<GreenNode>()
+        );
     }
 }
