@@ -57,6 +57,7 @@ mod tests {
         assert_eq!(size_of::<GreenTokenData>(), size_of::<u32>());
         assert_eq!(token_allocation_layout(0, false).size(), 8);
         assert_eq!(token_allocation_layout(1, false).size(), 12);
+        assert_eq!(token_allocation_layout(9, false).size(), 16);
         #[cfg(target_pointer_width = "64")]
         {
             assert_eq!(size_of::<PackedGreenChild>(), size_of::<u32>());
@@ -289,5 +290,38 @@ mod tests {
         assert_eq!(cloned.kind(), SyntaxKind(u16::MAX));
         assert_eq!(cloned.text_len(), (text.len() as u32).into());
         assert_eq!(cloned.text(), text);
+    }
+
+    #[test]
+    fn short_wide_kind_tokens_preserve_ownership() {
+        let token = GreenToken::new(SyntaxKind(u16::MAX), "x");
+        let clones = (0..5000).map(|_| token.clone()).collect::<Vec<_>>();
+        let survivor = clones[0].clone();
+        drop(token);
+        drop(clones);
+
+        assert_eq!(survivor.kind(), SyntaxKind(u16::MAX));
+        assert_eq!(survivor.text(), "x");
+    }
+
+    #[test]
+    fn heavily_shared_tokens_preserve_ownership() {
+        let token = GreenToken::new(SyntaxKind(1), "shared-long");
+        let clones = (0..5000).map(|_| token.clone()).collect::<Vec<_>>();
+        let survivor = clones[0].clone();
+        drop(token);
+
+        assert!(clones.iter().all(|clone| clone.text() == "shared-long"));
+        assert!(clones.windows(2).all(|pair| std::ptr::eq(&*pair[0], &*pair[1])));
+        let mut groups = (0..8).map(|_| Vec::new()).collect::<Vec<_>>();
+        for (index, clone) in clones.into_iter().enumerate() {
+            groups[index % 8].push(clone);
+        }
+        std::thread::scope(|scope| {
+            for group in groups {
+                scope.spawn(move || drop(group));
+            }
+        });
+        assert_eq!(survivor.text(), "shared-long");
     }
 }
