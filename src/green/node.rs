@@ -283,7 +283,7 @@ impl GreenNodeData {
 
     #[inline]
     fn checkpoints_with_count(&self, child_count: usize) -> &[TextSize] {
-        let len = child_count.saturating_sub(1) / CHILDREN_PER_CHECKPOINT;
+        let len = stored_checkpoint_count(child_count);
         #[cfg(target_pointer_width = "64")]
         let ptr = if self.is_wide() {
             self.wide_child_ptr().wrapping_add(child_count).cast()
@@ -293,16 +293,16 @@ impl GreenNodeData {
         #[cfg(not(target_pointer_width = "64"))]
         let ptr = self.wide_child_ptr().wrapping_add(child_count).cast();
         // SAFETY: Construction writes one checkpoint after the child tail for every block after
-        // the first. The first block always starts at zero.
+        // the second. The first block starts at zero and the second is derived from its children.
         unsafe { slice::from_raw_parts(ptr, len) }
     }
 
     #[inline]
-    fn block_offset(checkpoints: &[TextSize], block: usize) -> TextSize {
-        if block == 0 {
-            0.into()
-        } else {
-            checkpoints[block - 1]
+    fn block_offset(&self, checkpoints: &[TextSize], block: usize) -> TextSize {
+        match block {
+            0 => 0.into(),
+            1 => (0..CHILDREN_PER_CHECKPOINT).map(|index| self.child_ref(index).text_len()).sum(),
+            _ => checkpoints[block - 2],
         }
     }
 
@@ -396,14 +396,20 @@ impl GreenNodeData {
             return None;
         }
         let checkpoints = self.checkpoints_with_count(child_count);
-        let block = checkpoints.partition_point(|&offset| offset <= rel_range.start());
+        let block = if child_count <= CHILDREN_PER_CHECKPOINT
+            || rel_range.start() < self.block_offset(checkpoints, 1)
+        {
+            0
+        } else {
+            1 + checkpoints.partition_point(|&offset| offset <= rel_range.start())
+        };
         let start = block * CHILDREN_PER_CHECKPOINT;
         let end = (start + CHILDREN_PER_CHECKPOINT).min(child_count);
-        let mut rel_offset = Self::block_offset(checkpoints, block);
+        let mut rel_offset = self.block_offset(checkpoints, block);
         let mut candidate = start.checked_sub(1).map(|index| {
             let previous_block = index / CHILDREN_PER_CHECKPOINT;
             let previous_block_start = previous_block * CHILDREN_PER_CHECKPOINT;
-            let mut previous_offset = Self::block_offset(checkpoints, previous_block);
+            let mut previous_offset = self.block_offset(checkpoints, previous_block);
             for child_index in previous_block_start..index {
                 previous_offset += self.child_ref(child_index).text_len();
             }
@@ -479,7 +485,7 @@ impl ops::Deref for GreenNode {
 }
 
 pub(super) fn allocation_layout(child_count: usize, wide: bool) -> Layout {
-    let checkpoints = child_count.saturating_sub(1) / CHILDREN_PER_CHECKPOINT;
+    let checkpoints = stored_checkpoint_count(child_count);
     let children_offset =
         offset_of!(GreenNodeAllocation, data) + offset_of!(GreenNodeData, children);
     let wide_count_size = mem::size_of::<GreenChild>() * wide_count_slots(child_count, wide);
@@ -505,6 +511,11 @@ pub(super) fn allocation_layout(child_count: usize, wide: bool) -> Layout {
     let align = mem::align_of::<GreenNodeAllocation>();
     let size = usable_size.checked_add(align - 1).unwrap() & !(align - 1);
     Layout::from_size_align(size, align).expect("invalid green node allocation layout")
+}
+
+#[inline]
+const fn stored_checkpoint_count(child_count: usize) -> usize {
+    child_count.saturating_sub(CHILDREN_PER_CHECKPOINT + 1) / CHILDREN_PER_CHECKPOINT
 }
 
 #[inline]
@@ -566,7 +577,7 @@ unsafe fn promote_to_wide(
         unsafe { ptr::write(new_children.add(index), GreenChild::from_element(child)) };
     }
 
-    let checkpoints = initialized_children.saturating_sub(1) / CHILDREN_PER_CHECKPOINT;
+    let checkpoints = stored_checkpoint_count(initialized_children);
     let old_checkpoints = unsafe { old_children.add(child_count).cast::<TextSize>() };
     let new_checkpoints = unsafe { new_children.add(child_count).cast::<TextSize>() };
     unsafe { ptr::copy_nonoverlapping(old_checkpoints, new_checkpoints, checkpoints) };
@@ -738,11 +749,11 @@ impl GreenNode {
             #[cfg(target_pointer_width = "64")]
             if wide {
                 let child_ptr = unsafe { allocation_child_ptr(allocation, child_count, true) };
-                if index != 0 && index % CHILDREN_PER_CHECKPOINT == 0 {
+                if index > CHILDREN_PER_CHECKPOINT && index % CHILDREN_PER_CHECKPOINT == 0 {
                     let checkpoint_ptr = unsafe { child_ptr.add(child_count).cast::<TextSize>() };
                     unsafe {
                         ptr::write(
-                            checkpoint_ptr.add(index / CHILDREN_PER_CHECKPOINT - 1),
+                            checkpoint_ptr.add(index / CHILDREN_PER_CHECKPOINT - 2),
                             text_len,
                         )
                     };
@@ -755,12 +766,12 @@ impl GreenNode {
                 match PackedGreenChild::try_from_element(parent, element) {
                     Ok(child) => {
                         let child_ptr = unsafe { allocation_packed_child_ptr(allocation) };
-                        if index != 0 && index % CHILDREN_PER_CHECKPOINT == 0 {
+                        if index > CHILDREN_PER_CHECKPOINT && index % CHILDREN_PER_CHECKPOINT == 0 {
                             let checkpoint_ptr =
                                 unsafe { child_ptr.add(child_count).cast::<TextSize>() };
                             unsafe {
                                 ptr::write(
-                                    checkpoint_ptr.add(index / CHILDREN_PER_CHECKPOINT - 1),
+                                    checkpoint_ptr.add(index / CHILDREN_PER_CHECKPOINT - 2),
                                     text_len,
                                 )
                             };
@@ -775,12 +786,12 @@ impl GreenNode {
 
                         let child_ptr =
                             unsafe { allocation_child_ptr(allocation, child_count, true) };
-                        if index != 0 && index % CHILDREN_PER_CHECKPOINT == 0 {
+                        if index > CHILDREN_PER_CHECKPOINT && index % CHILDREN_PER_CHECKPOINT == 0 {
                             let checkpoint_ptr =
                                 unsafe { child_ptr.add(child_count).cast::<TextSize>() };
                             unsafe {
                                 ptr::write(
-                                    checkpoint_ptr.add(index / CHILDREN_PER_CHECKPOINT - 1),
+                                    checkpoint_ptr.add(index / CHILDREN_PER_CHECKPOINT - 2),
                                     text_len,
                                 )
                             };
@@ -794,11 +805,11 @@ impl GreenNode {
             #[cfg(not(target_pointer_width = "64"))]
             {
                 let child_ptr = unsafe { allocation_child_ptr(allocation, child_count, wide) };
-                if index != 0 && index % CHILDREN_PER_CHECKPOINT == 0 {
+                if index > CHILDREN_PER_CHECKPOINT && index % CHILDREN_PER_CHECKPOINT == 0 {
                     let checkpoint_ptr = unsafe { child_ptr.add(child_count).cast::<TextSize>() };
                     unsafe {
                         ptr::write(
-                            checkpoint_ptr.add(index / CHILDREN_PER_CHECKPOINT - 1),
+                            checkpoint_ptr.add(index / CHILDREN_PER_CHECKPOINT - 2),
                             text_len,
                         )
                     };
@@ -1098,7 +1109,7 @@ impl<'a> GreenChildren<'a> {
     fn child_at(&self, index: usize) -> GreenChildRef<'a> {
         let block = index / CHILDREN_PER_CHECKPOINT;
         let block_start = block * CHILDREN_PER_CHECKPOINT;
-        let mut rel_offset = if block == 0 { 0.into() } else { self.checkpoints[block - 1] };
+        let mut rel_offset = self.node.block_offset(self.checkpoints, block);
         for child_index in block_start..index {
             rel_offset += self.node.child_ref(child_index).text_len();
         }

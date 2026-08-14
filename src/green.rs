@@ -63,6 +63,7 @@ mod tests {
             assert_eq!(size_of::<PackedGreenChild>(), size_of::<u32>());
             assert_eq!(allocation_layout(1, false).size(), 12);
             assert_eq!(allocation_layout(2, false).size(), 16);
+            assert_eq!(allocation_layout(5, false).size(), 28);
         }
     }
 
