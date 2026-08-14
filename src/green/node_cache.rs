@@ -1,7 +1,11 @@
 use hashbrown::hash_map::RawEntryMut;
 use rustc_hash::FxHasher;
 use std::{
+    fmt,
     hash::{BuildHasherDefault, Hash, Hasher},
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    ptr::{self, NonNull},
     sync::Mutex,
 };
 
@@ -10,46 +14,226 @@ use crate::{GreenNode, GreenNodeData, GreenToken, GreenTokenData, NodeOrToken, S
 use super::element::GreenElement;
 
 type HashMap<K, V> = hashbrown::HashMap<K, V, BuildHasherDefault<FxHasher>>;
-type SharedSlot<T> = [Option<T>; 2];
+type SharedSlot<T> = [PackedSharedValue<T>; 2];
 type NodeShard = Mutex<SharedShard<GreenNode>>;
 type TokenShard = Mutex<SharedShard<GreenToken>>;
 
-#[derive(Debug)]
-struct SharedShard<T> {
-    slots: Box<[SharedSlot<T>]>,
+trait SharedValue: Clone + PartialEq {
+    type Data;
+
+    fn as_ptr(&self) -> NonNull<Self::Data>;
+    fn into_raw(self) -> NonNull<Self::Data>;
+
+    /// # Safety
+    ///
+    /// `ptr` must have been returned by `Self::into_raw` and still own that reference.
+    unsafe fn from_raw(ptr: NonNull<Self::Data>) -> Self;
 }
 
-impl<T> Default for SharedShard<T> {
-    fn default() -> Self {
-        SharedShard { slots: Box::new([]) }
+impl SharedValue for GreenNode {
+    type Data = GreenNodeData;
+
+    fn as_ptr(&self) -> NonNull<Self::Data> {
+        NonNull::from(&**self)
+    }
+
+    fn into_raw(self) -> NonNull<Self::Data> {
+        GreenNode::into_raw(self)
+    }
+
+    unsafe fn from_raw(ptr: NonNull<Self::Data>) -> Self {
+        // SAFETY: The caller upholds `SharedValue::from_raw`'s ownership contract.
+        unsafe { GreenNode::from_raw(ptr) }
     }
 }
 
-impl<T: Clone + PartialEq> SharedShard<T> {
+impl SharedValue for GreenToken {
+    type Data = GreenTokenData;
+
+    fn as_ptr(&self) -> NonNull<Self::Data> {
+        NonNull::from(&**self)
+    }
+
+    fn into_raw(self) -> NonNull<Self::Data> {
+        GreenToken::into_raw(self)
+    }
+
+    unsafe fn from_raw(ptr: NonNull<Self::Data>) -> Self {
+        // SAFETY: The caller upholds `SharedValue::from_raw`'s ownership contract.
+        unsafe { GreenToken::from_raw(ptr) }
+    }
+}
+
+const EMPTY_SHARED_VALUE: i32 = 0;
+const WIDE_SHARED_VALUE: i32 = i32::MIN;
+
+#[repr(transparent)]
+struct PackedSharedValue<T: SharedValue> {
+    offset: i32,
+    _marker: PhantomData<T>,
+}
+
+impl<T: SharedValue> PackedSharedValue<T> {
+    fn empty() -> Self {
+        Self { offset: EMPTY_SHARED_VALUE, _marker: PhantomData }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.offset == EMPTY_SHARED_VALUE
+    }
+
+    fn is_wide(&self) -> bool {
+        self.offset == WIDE_SHARED_VALUE
+    }
+
+    fn set_wide(&mut self) {
+        debug_assert!(self.is_empty());
+        self.offset = WIDE_SHARED_VALUE;
+    }
+
+    fn with_value<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
+        if self.is_empty() || self.is_wide() {
+            return None;
+        }
+        // SAFETY: A non-sentinel offset was created by `store`, which transferred one owner into
+        // this stable boxed slot. The temporary owner is not dropped and cannot escape `f`.
+        let owner = ManuallyDrop::new(unsafe { T::from_raw(self.ptr()) });
+        Some(f(&owner))
+    }
+
+    fn store(&mut self, value: T) -> Result<(), T> {
+        debug_assert!(self.is_empty());
+        let base = self as *const Self as usize;
+        let target = value.as_ptr().as_ptr().expose_provenance();
+        let delta = target as i128 - base as i128;
+        if delta % 4 != 0 {
+            return Err(value);
+        }
+        let Ok(offset) = i32::try_from(delta / 4) else {
+            return Err(value);
+        };
+        if matches!(offset, EMPTY_SHARED_VALUE | WIDE_SHARED_VALUE) {
+            return Err(value);
+        }
+        _ = value.into_raw();
+        self.offset = offset;
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        if !self.is_empty() && !self.is_wide() {
+            // SAFETY: `store` transferred exactly one owner into this slot.
+            drop(unsafe { T::from_raw(self.ptr()) });
+        }
+        self.offset = EMPTY_SHARED_VALUE;
+    }
+
+    /// # Safety
+    ///
+    /// The slot must contain a non-sentinel offset written by `store`.
+    unsafe fn ptr(&self) -> NonNull<T::Data> {
+        let base = self as *const Self as usize;
+        let byte_offset = i64::from(self.offset) * 4;
+        let address = base.wrapping_add(byte_offset as usize);
+        // SAFETY: The stored offset names the live allocation whose owner is held by this slot.
+        unsafe { NonNull::new_unchecked(ptr::with_exposed_provenance_mut(address)) }
+    }
+}
+
+impl<T: SharedValue> Drop for PackedSharedValue<T> {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+impl<T: SharedValue> fmt::Debug for PackedSharedValue<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("PackedSharedValue").field(&self.offset).finish()
+    }
+}
+
+#[derive(Debug)]
+struct SharedShard<T: SharedValue> {
+    slots: Box<[SharedSlot<T>]>,
+    wide: Vec<(usize, T)>,
+}
+
+impl<T: SharedValue> Default for SharedShard<T> {
+    fn default() -> Self {
+        SharedShard { slots: Box::new([]), wide: Vec::new() }
+    }
+}
+
+impl<T: SharedValue> SharedShard<T> {
     #[cfg(test)]
     fn slot_count(&self) -> usize {
         self.slots.len() * 2
     }
 
-    fn get(&self, hash: u64, mut matches: impl FnMut(&T) -> bool) -> Option<&T> {
+    fn get(&self, hash: u64, mut matches: impl FnMut(&T) -> bool) -> Option<T> {
         if self.slots.is_empty() {
             return None;
         }
-        self.slots[self.set_index(hash)].iter().flatten().find(|value| matches(value))
+        let set = self.set_index(hash);
+        (0..2).find_map(|way| {
+            self.with_value(set, way, |value| matches(value).then(|| value.clone())).flatten()
+        })
     }
 
     fn insert(&mut self, hash: u64, value: T, capacity: usize) -> T {
         if self.slots.is_empty() {
-            self.slots = (0..capacity.div_ceil(2)).map(|_| [None, None]).collect::<Box<[_]>>();
+            self.slots = (0..capacity.div_ceil(2))
+                .map(|_| std::array::from_fn(|_| PackedSharedValue::empty()))
+                .collect::<Box<[_]>>();
         }
-        let index = self.set_index(hash);
-        if let Some(cached) = self.slots[index].iter().flatten().find(|it| *it == &value) {
-            return cached.clone();
+        let set = self.set_index(hash);
+        for way in 0..2 {
+            if let Some(cached) = self
+                .with_value(set, way, |cached| (cached == &value).then(|| cached.clone()))
+                .flatten()
+            {
+                return cached;
+            }
         }
-        let way =
-            self.slots[index].iter().position(Option::is_none).unwrap_or((hash >> 32) as usize % 2);
-        self.slots[index][way] = Some(value.clone());
+        let way = self.slots[set]
+            .iter()
+            .position(PackedSharedValue::is_empty)
+            .unwrap_or((hash >> 32) as usize % 2);
+        self.replace(set, way, value.clone());
         value
+    }
+
+    fn with_value<R>(&self, set: usize, way: usize, f: impl FnOnce(&T) -> R) -> Option<R> {
+        let slot = &self.slots[set][way];
+        if slot.is_wide() {
+            self.wide.iter().find(|(key, _)| *key == set * 2 + way).map(|(_, value)| f(value))
+        } else {
+            slot.with_value(f)
+        }
+    }
+
+    #[cfg(test)]
+    fn value(&self, set: usize, way: usize) -> Option<T> {
+        self.with_value(set, way, Clone::clone)
+    }
+
+    fn replace(&mut self, set: usize, way: usize, value: T) {
+        let key = set * 2 + way;
+        let slot = &mut self.slots[set][way];
+        if slot.is_wide() {
+            if let Some(index) = self.wide.iter().position(|(stored_key, _)| *stored_key == key) {
+                self.wide.swap_remove(index);
+            } else {
+                debug_assert!(false, "wide cache slot must own a fallback value");
+            }
+            slot.offset = EMPTY_SHARED_VALUE;
+        } else {
+            slot.clear();
+        }
+        if let Err(value) = slot.store(value) {
+            self.wide.push((key, value));
+            slot.set_wide();
+        }
     }
 
     fn set_index(&self, hash: u64) -> usize {
@@ -140,7 +324,7 @@ impl SharedNodeCache {
         let shard = self.nodes[hash as usize % SHARD_COUNT]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        shard.get(hash, |cached| node_matches(cached, kind, children)).cloned()
+        shard.get(hash, |cached| node_matches(cached, kind, children))
     }
 
     fn insert_node(&self, hash: u64, node: GreenNode) -> GreenNode {
@@ -154,7 +338,7 @@ impl SharedNodeCache {
         let shard = self.tokens[hash as usize % SHARD_COUNT]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        shard.get(hash, |cached| cached.kind() == kind && cached.text() == text).cloned()
+        shard.get(hash, |cached| cached.kind() == kind && cached.text() == text)
     }
 
     fn insert_token(&self, hash: u64, token: GreenToken) -> GreenToken {
@@ -337,9 +521,22 @@ mod tests {
 
         assert_eq!(cache.nodes[0].lock().unwrap().slot_count(), NODE_CAPACITY_PER_SHARD);
         assert_eq!(cache.tokens[0].lock().unwrap().slot_count(), TOKEN_CAPACITY_PER_SHARD);
-        assert_eq!(
-            std::mem::size_of::<SharedSlot<GreenNode>>(),
-            2 * std::mem::size_of::<GreenNode>()
-        );
+        assert_eq!(std::mem::size_of::<SharedSlot<GreenNode>>(), 2 * std::mem::size_of::<u32>());
+    }
+
+    #[test]
+    fn shared_cache_wide_fallback_preserves_ownership() {
+        let token = GreenToken::new(SyntaxKind(1), "fallback");
+        let mut shard = SharedShard {
+            slots: Box::new([[PackedSharedValue::empty(), PackedSharedValue::empty()]]),
+            ..SharedShard::default()
+        };
+        shard.wide.push((0, token.clone()));
+        shard.slots[0][0].set_wide();
+
+        let cached = shard.value(0, 0).unwrap();
+        assert!(std::ptr::eq::<GreenTokenData>(&*token, &*cached));
+        drop(shard);
+        assert_eq!(cached.text(), "fallback");
     }
 }
