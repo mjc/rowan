@@ -23,6 +23,7 @@ trait SharedValue: Clone + PartialEq {
 
     fn as_ptr(&self) -> NonNull<Self::Data>;
     fn into_raw(self) -> NonNull<Self::Data>;
+    fn cache_hash(&self) -> u64;
 
     /// # Safety
     ///
@@ -41,6 +42,10 @@ impl SharedValue for GreenNode {
         GreenNode::into_raw(self)
     }
 
+    fn cache_hash(&self) -> u64 {
+        node_hash(self)
+    }
+
     unsafe fn from_raw(ptr: NonNull<Self::Data>) -> Self {
         // SAFETY: The caller upholds `SharedValue::from_raw`'s ownership contract.
         unsafe { GreenNode::from_raw(ptr) }
@@ -56,6 +61,10 @@ impl SharedValue for GreenToken {
 
     fn into_raw(self) -> NonNull<Self::Data> {
         GreenToken::into_raw(self)
+    }
+
+    fn cache_hash(&self) -> u64 {
+        token_hash(self)
     }
 
     unsafe fn from_raw(ptr: NonNull<Self::Data>) -> Self {
@@ -165,7 +174,6 @@ impl<T: SharedValue> Default for SharedShard<T> {
 }
 
 impl<T: SharedValue> SharedShard<T> {
-    #[cfg(test)]
     fn slot_count(&self) -> usize {
         self.slots.len() * 2
     }
@@ -182,25 +190,58 @@ impl<T: SharedValue> SharedShard<T> {
 
     fn insert(&mut self, hash: u64, value: T, capacity: usize) -> T {
         if self.slots.is_empty() {
-            self.slots = (0..capacity.div_ceil(2))
-                .map(|_| std::array::from_fn(|_| PackedSharedValue::empty()))
-                .collect::<Box<[_]>>();
+            self.allocate(INITIAL_SHARED_CAPACITY.min(capacity));
         }
-        let set = self.set_index(hash);
-        for way in 0..2 {
-            if let Some(cached) = self
-                .with_value(set, way, |cached| (cached == &value).then(|| cached.clone()))
-                .flatten()
-            {
-                return cached;
+        loop {
+            let set = self.set_index(hash);
+            for way in 0..2 {
+                if let Some(cached) = self
+                    .with_value(set, way, |cached| (cached == &value).then(|| cached.clone()))
+                    .flatten()
+                {
+                    return cached;
+                }
+            }
+            if let Some(way) = self.slots[set].iter().position(PackedSharedValue::is_empty) {
+                self.replace(set, way, value.clone());
+                return value;
+            }
+            if self.slot_count() < capacity {
+                self.grow((self.slot_count() * 2).min(capacity));
+                continue;
+            }
+            let way = (hash >> 32) as usize % 2;
+            self.replace(set, way, value.clone());
+            return value;
+        }
+    }
+
+    fn allocate(&mut self, capacity: usize) {
+        self.slots = (0..capacity.div_ceil(2))
+            .map(|_| std::array::from_fn(|_| PackedSharedValue::empty()))
+            .collect();
+    }
+
+    fn grow(&mut self, capacity: usize) {
+        let mut values = Vec::new();
+        for set in 0..self.slots.len() {
+            for way in 0..2 {
+                if let Some(value) = self.with_value(set, way, Clone::clone) {
+                    values.push(value);
+                }
             }
         }
-        let way = self.slots[set]
-            .iter()
-            .position(PackedSharedValue::is_empty)
-            .unwrap_or((hash >> 32) as usize % 2);
-        self.replace(set, way, value.clone());
-        value
+        self.allocate(capacity);
+        self.wide.clear();
+        for value in values {
+            let hash = value.cache_hash();
+            let set = self.set_index(hash);
+            let way = self.slots[set]
+                .iter()
+                .position(PackedSharedValue::is_empty)
+                .unwrap_or((hash >> 32) as usize % 2);
+            self.replace(set, way, value);
+        }
     }
 
     fn with_value<R>(&self, set: usize, way: usize, f: impl FnOnce(&T) -> R) -> Option<R> {
@@ -252,6 +293,7 @@ pub struct NodeCache {
 }
 
 const SHARD_COUNT: usize = 256;
+const INITIAL_SHARED_CAPACITY: usize = 256;
 const NODE_CAPACITY_PER_SHARD: usize = 14 * 1024;
 const TOKEN_CAPACITY_PER_SHARD: usize = 4 * 1024;
 const MAX_SHARED_NODE_CHILDREN: usize = 1;
@@ -259,8 +301,9 @@ const MAX_SHARED_TOKEN_LEN: usize = 8;
 
 /// A bounded, thread-safe interner for sharing immutable green trees across builders.
 ///
-/// Individual shards use bounded two-way slots. A full slot overwrites one colliding entry, and
-/// hash matches are confirmed with structural equality before a tree is reused.
+/// Individual shards grow bounded two-way slots on collisions. At the maximum size, a full slot
+/// overwrites one colliding entry. Hash matches are confirmed with structural equality before a
+/// tree is reused.
 #[derive(Debug)]
 pub struct SharedNodeCache {
     nodes: Box<[NodeShard]>,
@@ -514,14 +557,31 @@ mod tests {
     }
 
     #[test]
-    fn shared_cache_reserves_bounded_shards_on_first_use() {
+    fn shared_cache_allocates_bounded_shards_on_first_use() {
         let cache = SharedNodeCache::default();
         cache.insert_node(0, GreenNode::new(SyntaxKind(1), []));
         cache.insert_token(0, GreenToken::new(SyntaxKind(1), "x"));
 
-        assert_eq!(cache.nodes[0].lock().unwrap().slot_count(), NODE_CAPACITY_PER_SHARD);
-        assert_eq!(cache.tokens[0].lock().unwrap().slot_count(), TOKEN_CAPACITY_PER_SHARD);
+        assert_eq!(cache.nodes[0].lock().unwrap().slot_count(), INITIAL_SHARED_CAPACITY);
+        assert_eq!(cache.tokens[0].lock().unwrap().slot_count(), INITIAL_SHARED_CAPACITY);
         assert_eq!(std::mem::size_of::<SharedSlot<GreenNode>>(), 2 * std::mem::size_of::<u32>());
+    }
+
+    #[test]
+    fn shared_shard_grows_without_losing_entries() {
+        let values = ["8", "12", "27"].map(|text| {
+            let token = GreenToken::new(SyntaxKind(1), text);
+            (token_hash(&token), token)
+        });
+        let mut shard = SharedShard::default();
+        for (hash, token) in &values {
+            shard.insert(*hash, token.clone(), INITIAL_SHARED_CAPACITY * 2);
+        }
+
+        assert_eq!(shard.slot_count(), INITIAL_SHARED_CAPACITY * 2);
+        for (hash, token) in values {
+            assert_eq!(shard.get(hash, |cached| cached == &token), Some(token));
+        }
     }
 
     #[test]
