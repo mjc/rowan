@@ -20,6 +20,10 @@ pub use self::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SyntaxKind(pub u16);
 
+pub(crate) fn trim_memory() {
+    allocator::trim();
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -90,6 +94,63 @@ mod tests {
         unsafe {
             super::allocator::deallocate(reused, layout);
             super::allocator::deallocate(second, layout);
+        }
+    }
+
+    #[test]
+    fn small_green_allocations_do_not_cross_trim_chunks() {
+        for size in (4..=256).step_by(4) {
+            let layout = Layout::from_size_align(size, 4).unwrap();
+            let allocation_count = 4096 / size + 1;
+            let allocations = (0..allocation_count)
+                .map(|_| {
+                    // SAFETY: Each allocation is retained and released below with the same layout.
+                    unsafe { super::allocator::allocate(layout) }
+                })
+                .collect::<Vec<_>>();
+
+            for ptr in &allocations {
+                assert!(ptr.addr().get() % 4096 + size <= 4096);
+            }
+            for ptr in allocations {
+                // SAFETY: Every allocation is live and was returned for `layout`.
+                unsafe { super::allocator::deallocate(ptr, layout) };
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn small_green_allocations_trim_empty_chunks() {
+        let layout = Layout::from_size_align(252, 4).unwrap();
+        let mut allocations = (0..33)
+            .map(|value| {
+                // SAFETY: The returned allocation is initialized below and released with the
+                // same layout before the test returns.
+                let ptr = unsafe { super::allocator::allocate(layout) };
+                // SAFETY: Every allocation is at least one byte and uniquely owned here.
+                unsafe { ptr.as_ptr().write(value) };
+                ptr
+            })
+            .collect::<Vec<_>>();
+
+        for ptr in allocations.drain(..16) {
+            // SAFETY: These allocations are live and were returned for `layout`.
+            unsafe { super::allocator::deallocate(ptr, layout) };
+        }
+        assert!(super::allocator::trim() >= 4096);
+        for (value, ptr) in allocations.iter().enumerate() {
+            // SAFETY: Trimming an empty chunk must not disturb any live allocation.
+            assert_eq!(unsafe { *ptr.as_ptr() }, value as u8 + 16);
+        }
+
+        allocations.extend((0..16).map(|_| {
+            // SAFETY: These allocations are released below with the same layout.
+            unsafe { super::allocator::allocate(layout) }
+        }));
+        for ptr in allocations {
+            // SAFETY: Every allocation is live and was returned for `layout`.
+            unsafe { super::allocator::deallocate(ptr, layout) };
         }
     }
 

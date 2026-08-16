@@ -25,6 +25,13 @@ pub mod ast;
 pub use crate::cursor::SyntaxTreeId;
 pub use text_size::{TextLen, TextRange, TextSize};
 
+/// Releases physical pages from empty internal green-tree allocation chunks.
+///
+/// Existing syntax trees remain valid, and reclaimed chunks are reused by later allocations.
+pub fn trim_memory() {
+    green::trim_memory();
+}
+
 pub use crate::{
     api::{
         Language, SyntaxElement, SyntaxElementChildren, SyntaxNode, SyntaxNodeChildren, SyntaxToken,
