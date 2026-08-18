@@ -1,7 +1,8 @@
 use crate::{
+    cow_mut::CowMut,
     green::{
-        node_cache::{CacheBackend, CachedElement, NodeCache, SharedNodeCache},
-        GreenNode, SyntaxKind,
+        node_cache::{NodeCache, SharedCache, SharedNodeCache},
+        GreenElement, GreenNode, SyntaxKind,
     },
     NodeOrToken,
 };
@@ -13,9 +14,9 @@ pub struct Checkpoint(usize);
 /// A builder for a green tree.
 #[derive(Default, Debug)]
 pub struct GreenNodeBuilder<'cache> {
-    cache: CacheBackend<'cache>,
+    cache: CowMut<'cache, NodeCache>,
     parents: Vec<(SyntaxKind, usize)>,
-    children: Vec<CachedElement>,
+    children: Vec<(u64, GreenElement)>,
 }
 
 impl GreenNodeBuilder<'_> {
@@ -28,20 +29,7 @@ impl GreenNodeBuilder<'_> {
     /// It allows to structurally share underlying trees.
     pub fn with_cache(cache: &mut NodeCache) -> GreenNodeBuilder<'_> {
         GreenNodeBuilder {
-            cache: CacheBackend::local(cache),
-            parents: Vec::new(),
-            children: Vec::new(),
-        }
-    }
-
-    /// Creates a builder that opts into sharing immutable green descendants with other builders
-    /// using the same cache.
-    ///
-    /// Each finished tree keeps a distinct root allocation. Builders created with [`Self::new`] or
-    /// [`Self::with_cache`] continue to use only the ordinary local cache.
-    pub fn with_shared_cache(cache: &SharedNodeCache) -> GreenNodeBuilder<'_> {
-        GreenNodeBuilder {
-            cache: CacheBackend::shared(cache),
+            cache: CowMut::Borrowed(cache),
             parents: Vec::new(),
             children: Vec::new(),
         }
@@ -50,7 +38,8 @@ impl GreenNodeBuilder<'_> {
     /// Adds new token to the current branch.
     #[inline]
     pub fn token(&mut self, kind: SyntaxKind, text: &str) {
-        self.children.push(self.cache.token(kind, text));
+        let (hash, token) = self.cache.token(kind, text);
+        self.children.push((hash, token.into()));
     }
 
     /// Start new node and make it current.
@@ -65,8 +54,8 @@ impl GreenNodeBuilder<'_> {
     #[inline]
     pub fn finish_node(&mut self) {
         let (kind, first_child) = self.parents.pop().unwrap();
-        let node = self.cache.node(kind, &mut self.children, first_child);
-        self.children.push(node);
+        let (hash, node) = self.cache.node(kind, &mut self.children, first_child);
+        self.children.push((hash, node.into()));
     }
 
     /// Prepare for maybe wrapping the next node.
@@ -125,9 +114,93 @@ impl GreenNodeBuilder<'_> {
     #[inline]
     pub fn finish(mut self) -> GreenNode {
         assert_eq!(self.children.len(), 1);
-        let root = match self.children.remove(0).1 {
-            NodeOrToken::Node(node) => node,
-            NodeOrToken::Token(_) => panic!(),
+        match self.children.pop() {
+            Some((_, NodeOrToken::Node(node))) => node,
+            Some((_, NodeOrToken::Token(_))) => panic!(),
+            None => unreachable!(),
+        }
+    }
+}
+
+/// A builder that opts into bounded sharing of immutable green descendants.
+///
+/// Each finished tree keeps a distinct root allocation when the root came from the shared cache.
+/// A root built by the private local fallback is already distinct and is returned directly.
+#[derive(Debug)]
+pub struct SharedGreenNodeBuilder<'cache> {
+    cache: SharedCache<'cache>,
+    parents: Vec<(SyntaxKind, usize)>,
+    children: Vec<(u64, GreenElement)>,
+}
+
+impl<'cache> SharedGreenNodeBuilder<'cache> {
+    /// Creates a builder backed by `cache`.
+    pub fn new(cache: &'cache SharedNodeCache) -> Self {
+        SharedGreenNodeBuilder {
+            cache: SharedCache::new(cache),
+            parents: Vec::new(),
+            children: Vec::new(),
+        }
+    }
+
+    /// Adds new token to the current branch.
+    #[inline]
+    pub fn token(&mut self, kind: SyntaxKind, text: &str) {
+        let (hash, token) = self.cache.token(kind, text);
+        self.children.push((hash, token.into()));
+    }
+
+    /// Start new node and make it current.
+    #[inline]
+    pub fn start_node(&mut self, kind: SyntaxKind) {
+        let len = self.children.len();
+        self.parents.push((kind, len));
+    }
+
+    /// Finish current branch and restore the previous branch as current.
+    #[inline]
+    pub fn finish_node(&mut self) {
+        let (kind, first_child) = match self.parents.pop() {
+            Some(parent) => parent,
+            None => panic!("finish_node called without a matching start_node"),
+        };
+        let (hash, node) = self.cache.node(kind, &mut self.children, first_child);
+        self.children.push((hash, node.into()));
+    }
+
+    /// Prepare for maybe wrapping the next node.
+    #[inline]
+    pub fn checkpoint(&self) -> Checkpoint {
+        Checkpoint(self.children.len())
+    }
+
+    /// Wrap the previous branch marked by `checkpoint` in a new branch and make it current.
+    #[inline]
+    pub fn start_node_at(&mut self, checkpoint: Checkpoint, kind: SyntaxKind) {
+        let Checkpoint(checkpoint) = checkpoint;
+        assert!(
+            checkpoint <= self.children.len(),
+            "checkpoint no longer valid, was finish_node called early?"
+        );
+
+        if let Some(&(_, first_child)) = self.parents.last() {
+            assert!(
+                checkpoint >= first_child,
+                "checkpoint no longer valid, was an unmatched start_node_at called?"
+            );
+        }
+
+        self.parents.push((kind, checkpoint));
+    }
+
+    /// Completes tree building.
+    #[inline]
+    pub fn finish(mut self) -> GreenNode {
+        assert_eq!(self.children.len(), 1);
+        let root = match self.children.pop() {
+            Some((_, NodeOrToken::Node(node))) => node,
+            Some((_, NodeOrToken::Token(_))) => panic!(),
+            None => unreachable!(),
         };
         self.cache.finish(root)
     }
@@ -139,7 +212,7 @@ mod tests {
     use crate::{cursor::SyntaxNode, SharedNodeCache};
 
     fn build(cache: &SharedNodeCache) -> GreenNode {
-        let mut builder = GreenNodeBuilder::with_shared_cache(cache);
+        let mut builder = SharedGreenNodeBuilder::new(cache);
         builder.start_node(SyntaxKind(0));
         builder.token(SyntaxKind(1), "one");
         builder.finish_node();
@@ -170,7 +243,7 @@ mod tests {
     #[test]
     fn shared_cache_does_not_share_long_tokens_through_unary_nodes() {
         fn build(cache: &SharedNodeCache) -> GreenNode {
-            let mut builder = GreenNodeBuilder::with_shared_cache(cache);
+            let mut builder = SharedGreenNodeBuilder::new(cache);
             builder.start_node(SyntaxKind(0));
             builder.token(SyntaxKind(1), "123456789");
             builder.finish_node();
@@ -191,7 +264,7 @@ mod tests {
     #[test]
     fn shared_cache_does_not_share_wide_nodes_through_unary_parents() {
         fn build(cache: &SharedNodeCache) -> GreenNode {
-            let mut builder = GreenNodeBuilder::with_shared_cache(cache);
+            let mut builder = SharedGreenNodeBuilder::new(cache);
             builder.start_node(SyntaxKind(0));
             builder.start_node(SyntaxKind(1));
             builder.token(SyntaxKind(2), "one");
@@ -215,7 +288,7 @@ mod tests {
     #[test]
     fn shared_cache_shares_recursively_eligible_unary_chains() {
         fn build(cache: &SharedNodeCache) -> GreenNode {
-            let mut builder = GreenNodeBuilder::with_shared_cache(cache);
+            let mut builder = SharedGreenNodeBuilder::new(cache);
             builder.start_node(SyntaxKind(0));
             builder.start_node(SyntaxKind(1));
             builder.token(SyntaxKind(2), "short");
@@ -251,7 +324,7 @@ mod tests {
     #[test]
     fn shared_cache_limits_nodes_and_tokens() {
         fn build(cache: &SharedNodeCache, text: &str) -> GreenNode {
-            let mut builder = GreenNodeBuilder::with_shared_cache(cache);
+            let mut builder = SharedGreenNodeBuilder::new(cache);
             builder.start_node(SyntaxKind(0));
             builder.token(SyntaxKind(1), text);
             builder.token(SyntaxKind(1), text);
@@ -291,7 +364,7 @@ mod tests {
     #[test]
     fn shared_cache_does_not_retain_wide_subtrees() {
         fn build(cache: &SharedNodeCache, middle: &str) -> GreenNode {
-            let mut builder = GreenNodeBuilder::with_shared_cache(cache);
+            let mut builder = SharedGreenNodeBuilder::new(cache);
             builder.start_node(SyntaxKind(0));
             builder.start_node(SyntaxKind(1));
             for index in 0..65 {
@@ -315,7 +388,7 @@ mod tests {
     #[test]
     fn shared_cache_uses_local_fallback_for_ineligible_elements() {
         let cache = SharedNodeCache::default();
-        let mut builder = GreenNodeBuilder::with_shared_cache(&cache);
+        let mut builder = SharedGreenNodeBuilder::new(&cache);
         builder.start_node(SyntaxKind(0));
         for _ in 0..2 {
             builder.start_node(SyntaxKind(1));

@@ -9,7 +9,7 @@ use self::element::GreenElement;
 pub(crate) use self::{element::GreenElementRef, node::GreenChild};
 
 pub use self::{
-    builder::{Checkpoint, GreenNodeBuilder},
+    builder::{Checkpoint, GreenNodeBuilder, SharedGreenNodeBuilder},
     node::{Children, GreenNode, GreenNodeData},
     node_cache::{NodeCache, SharedNodeCache},
     token::{GreenToken, GreenTokenData},
