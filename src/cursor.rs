@@ -63,6 +63,7 @@ struct NodeData {
     index: u32,
     green: Green,
     offset: TextSize,
+    root: ptr::NonNull<GreenNodeData>,
 }
 
 pub type SyntaxElement = NodeOrToken<SyntaxNode, SyntaxToken>;
@@ -145,6 +146,13 @@ impl NodeData {
         green: Green,
     ) -> ptr::NonNull<NodeData> {
         let parent = ManuallyDrop::new(parent);
+        let root = match parent.as_ref() {
+            Some(parent) => parent.data().root,
+            None => match &green {
+                Green::Node { ptr } => *ptr,
+                Green::Token { .. } => unreachable!("a token cannot be a root"),
+            },
+        };
         let res = NodeData {
             _c: Count::new(),
             rc: Cell::new(1),
@@ -152,6 +160,7 @@ impl NodeData {
             index,
             green,
             offset,
+            root,
         };
         unsafe { ptr::NonNull::new_unchecked(Box::into_raw(Box::new(res))) }
     }
@@ -173,12 +182,12 @@ impl NodeData {
     }
 
     #[inline]
-    fn key(&self) -> (ptr::NonNull<()>, TextSize) {
+    fn key(&self) -> (ptr::NonNull<GreenNodeData>, ptr::NonNull<()>, TextSize) {
         let ptr = match &self.green {
             Green::Node { ptr } => ptr.cast(),
             Green::Token { ptr } => ptr.cast(),
         };
-        (ptr, self.offset())
+        (self.root, ptr, self.offset())
     }
 
     #[inline]
@@ -301,7 +310,9 @@ impl SyntaxNode {
     }
 
     pub fn clone_subtree(&self) -> SyntaxNode {
-        SyntaxNode::new_root(self.green().to_owned())
+        let green = self.green();
+        let root = GreenNode::new(green.kind(), green.children().map(|child| child.to_owned()));
+        SyntaxNode::new_root(root)
     }
 
     #[inline]
@@ -998,6 +1009,44 @@ impl Iterator for PreorderWithTokens {
             })
         });
         next
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::hash_map::DefaultHasher, hash::Hash as _, hash::Hasher as _};
+
+    use crate::{GreenNode, GreenToken, SyntaxKind};
+
+    use super::SyntaxNode;
+
+    fn hash(node: &SyntaxNode) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        node.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn repeated_root_reconstruction_preserves_syntax_identity() {
+        let kind = SyntaxKind(0);
+        let green = GreenNode::new(kind, [GreenToken::new(kind, "token").into()]);
+        let first = SyntaxNode::new_root(green.clone());
+        let second = SyntaxNode::new_root(green);
+
+        assert_eq!(first, second);
+        assert_eq!(first.first_token(), second.first_token());
+        assert_eq!(hash(&first), hash(&second));
+    }
+
+    #[test]
+    fn cloned_subtree_has_independent_syntax_identity() {
+        let kind = SyntaxKind(0);
+        let green = GreenNode::new(kind, [GreenToken::new(kind, "token").into()]);
+        let original = SyntaxNode::new_root(green);
+        let cloned = original.clone_subtree();
+
+        assert_ne!(original, cloned);
+        assert_ne!(original.first_token(), cloned.first_token());
     }
 }
 // endregion
