@@ -191,6 +191,16 @@ impl NodeData {
     }
 
     #[inline]
+    fn hash_key<H: Hasher>(&self, state: &mut H) {
+        // Equality compares the full key; fold its pointers to keep hashing at two writes.
+        let (root, ptr, offset) = self.key();
+        let root = root.as_ptr() as usize;
+        let ptr = ptr.as_ptr() as usize;
+        (ptr ^ root.rotate_left(usize::BITS / 2)).hash(state);
+        offset.hash(state);
+    }
+
+    #[inline]
     fn parent_node(&self) -> Option<SyntaxNode> {
         let parent = self.parent()?;
         debug_assert!(matches!(parent.green, Green::Node { .. }));
@@ -794,7 +804,7 @@ impl Eq for SyntaxNode {}
 impl Hash for SyntaxNode {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.data().key().hash(state);
+        self.data().hash_key(state);
     }
 }
 
@@ -831,7 +841,7 @@ impl Eq for SyntaxToken {}
 impl Hash for SyntaxToken {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.data().key().hash(state);
+        self.data().hash_key(state);
     }
 }
 
