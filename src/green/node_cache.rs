@@ -7,11 +7,12 @@ use std::{
 };
 
 use crate::{
-    green::{GreenChild, GreenElementRef},
-    GreenNode, GreenNodeData, GreenToken, GreenTokenData, NodeOrToken, SyntaxKind,
+    green::GreenElementRef, GreenNode, GreenNodeData, GreenToken, GreenTokenData, NodeOrToken,
+    SyntaxKind,
 };
 
 use super::element::GreenElement;
+use super::{node, token};
 
 type HashMap<K, V> = hashbrown::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 type SharedNodeMap = HashMap<Hashed<GreenNode>, ()>;
@@ -107,8 +108,9 @@ const _: () = {
 /// Individual shards grow on demand and rotate when their aggregate accounted retained weight
 /// reaches its budget, with entry counts as a secondary guard. Across all shards, the accounted
 /// budgets are at most 256 MiB for nodes and 16 MiB for tokens before eviction. These are retention
-/// accounting limits, not exact allocator-byte guarantees. Parent weights conservatively include
-/// retained descendants, and hash matches are confirmed with structural equality.
+/// accounting limits, not exact allocator-byte guarantees. Each weight includes the retained green
+/// allocation and its hash-table entry storage; parent weights conservatively include retained
+/// descendants. Hash matches are confirmed with structural equality.
 #[derive(Debug)]
 pub struct SharedNodeCache {
     nodes: Box<[NodeShard]>,
@@ -160,8 +162,8 @@ fn cached_node_hash(kind: SyntaxKind, children: &[(u64, GreenElement)]) -> Optio
 }
 
 fn node_weight(child_count: usize, elements: &[SharedElement]) -> Option<u32> {
-    let node = mem::size_of::<GreenNode>()
-        .saturating_add(child_count.saturating_mul(mem::size_of::<GreenChild>()))
+    let node = node::allocation_size(child_count)
+        .saturating_add(cache_entry_size::<GreenNode>())
         .min(u32::MAX as usize) as u32;
     elements.iter().try_fold(node, |weight, element| match element {
         SharedElement::Local => None,
@@ -176,7 +178,13 @@ fn token_weight(text: &str) -> u32 {
 }
 
 fn token_weight_for_len(text_len: usize) -> u32 {
-    mem::size_of::<GreenToken>().saturating_add(text_len).min(u32::MAX as usize) as u32
+    token::allocation_size(text_len)
+        .saturating_add(cache_entry_size::<GreenToken>())
+        .min(u32::MAX as usize) as u32
+}
+
+fn cache_entry_size<T>() -> usize {
+    mem::size_of::<(Hashed<T>, ())>().saturating_add(1)
 }
 
 fn element_id(element: GreenElementRef<'_>) -> *const () {
@@ -224,11 +232,17 @@ impl SharedNodeCache {
     ) -> GreenNode {
         let mut shard =
             self.nodes[shard_index(hash)].lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((cached, ())) = shard.entries.raw_entry().from_hash(hash, |cached| {
-            cached.hash == hash && node_matches(&cached.value, kind, &children[first_child..])
-        }) {
+        if let Some(cached) = shard
+            .entries
+            .raw_entry()
+            .from_hash(hash, |cached| {
+                cached.hash == hash && node_matches(&cached.value, kind, &children[first_child..])
+            })
+            .map(|(cached, ())| cached.value.clone())
+        {
+            drop(shard);
             drop(children.drain(first_child..));
-            return cached.value.clone();
+            return cached;
         }
         let old = (shard.entries.len() >= NODE_CAPACITY_PER_SHARD
             || shard.retained_weight.saturating_add(retained_weight)
@@ -469,6 +483,12 @@ mod tests {
     #[test]
     fn token_weight_saturates() {
         assert_eq!(token_weight_for_len(usize::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn retained_weights_include_allocation_and_cache_entry_storage() {
+        assert!(token_weight_for_len(0) > mem::size_of::<GreenToken>() as u32);
+        assert!(node_weight(0, &[]).unwrap() > mem::size_of::<GreenNode>() as u32);
     }
 
     #[test]

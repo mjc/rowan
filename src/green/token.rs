@@ -1,4 +1,5 @@
 use std::{
+    alloc::Layout,
     borrow::Borrow,
     fmt,
     mem::{self, ManuallyDrop},
@@ -8,7 +9,7 @@ use std::{
 use countme::Count;
 
 use crate::{
-    arc::{Arc, HeaderSlice, ThinArc},
+    arc::{Arc, ArcInner, HeaderSlice, ThinArc},
     green::SyntaxKind,
     TextSize,
 };
@@ -21,6 +22,15 @@ struct GreenTokenHead {
 
 type Repr = HeaderSlice<GreenTokenHead, [u8]>;
 type ReprThin = HeaderSlice<GreenTokenHead, [u8; 0]>;
+
+pub(super) fn allocation_size(text_len: usize) -> usize {
+    Layout::from_size_align(
+        mem::size_of::<ArcInner<ReprThin>>().saturating_add(text_len),
+        mem::align_of::<ArcInner<ReprThin>>(),
+    )
+    .map_or(usize::MAX, |layout| layout.pad_to_align().size())
+}
+
 #[repr(transparent)]
 pub struct GreenTokenData {
     data: ReprThin,
@@ -134,5 +144,19 @@ impl ops::Deref for GreenToken {
             let repr: &ReprThin = &*(repr as *const Repr as *const ReprThin);
             mem::transmute::<&ReprThin, &GreenTokenData>(repr)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allocation_size_includes_padding() {
+        let unpadded = mem::size_of::<ArcInner<ReprThin>>() + 1;
+        let align = mem::align_of::<ArcInner<ReprThin>>();
+        let expected = (unpadded + align - 1) & !(align - 1);
+
+        assert_eq!(allocation_size(1), expected);
     }
 }
