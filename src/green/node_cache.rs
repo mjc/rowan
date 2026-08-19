@@ -563,7 +563,13 @@ impl<'cache> SharedCacheBackend<'cache> {
 mod tests {
     use super::*;
     use crate::GreenNodeBuilder;
-    use std::{sync::Arc, thread};
+    use std::{
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc, Barrier,
+        },
+        thread,
+    };
 
     fn build(cache: &SharedNodeCache) -> GreenNode {
         let mut builder = GreenNodeBuilder::with_shared_cache(cache);
@@ -596,6 +602,61 @@ mod tests {
     fn retained_weights_include_allocation_and_cache_entry_storage() {
         assert!(token_weight_for_len(0) > mem::size_of::<GreenToken>() as u32);
         assert!(node_weight(&[]).unwrap() > mem::size_of::<GreenNode>() as u32);
+    }
+
+    #[test]
+    fn shared_backend_records_production_retained_weights() {
+        let cache = SharedNodeCache::default();
+        let mut backend = SharedCacheBackend::new(&cache);
+        backend.token(SyntaxKind(1), "token");
+
+        let token = &backend.children[0];
+        assert_eq!(token.retained_weight, token_weight("token"));
+        assert_eq!(
+            cache.tokens[shard_index(token.hash)].lock().unwrap().retained_weight,
+            token.retained_weight
+        );
+
+        let node_hash = cached_node_hash(SyntaxKind(2), &backend.children);
+        let node_weight = node_weight(&backend.children).unwrap();
+        backend.node(SyntaxKind(2), 0);
+
+        assert_eq!(backend.children[0].retained_weight, node_weight);
+        assert_eq!(
+            cache.nodes[shard_index(node_hash)].lock().unwrap().retained_weight,
+            node_weight
+        );
+    }
+
+    #[test]
+    fn shared_backend_rotates_token_shards_by_production_weight() {
+        let cache = SharedNodeCache::default();
+        let mut backend = SharedCacheBackend::new(&cache);
+        let mut expected_weight: u32 = 0;
+
+        for index in 0_u32.. {
+            let text = format!("{index:08x}");
+            let hash = token_hash_parts(SyntaxKind(1), &text);
+            if shard_index(hash) != 0 {
+                continue;
+            }
+
+            let weight = token_weight(&text);
+            let rotated = expected_weight.saturating_add(weight) > TOKEN_RETAINED_WEIGHT_PER_SHARD;
+            if rotated {
+                expected_weight = 0;
+            }
+            expected_weight += weight;
+
+            backend.token(SyntaxKind(1), &text);
+            let token = backend.children.pop().unwrap();
+            assert_eq!(token.retained_weight, weight);
+            assert_eq!(cache.tokens[0].lock().unwrap().retained_weight, expected_weight);
+
+            if rotated {
+                break;
+            }
+        }
     }
 
     #[test]
@@ -678,6 +739,30 @@ mod tests {
     }
 
     #[test]
+    fn shared_cache_rotates_node_shards_by_entry_count() {
+        let cache = SharedNodeCache::default();
+        for kind in 0..=NODE_CAPACITY_PER_SHARD {
+            cache.node(kind as u64, SyntaxKind(kind as u16), &mut Vec::new(), 0, 1);
+        }
+
+        let shard = cache.nodes[0].lock().unwrap();
+        assert_eq!(shard.entries.len(), 1);
+        assert_eq!(shard.retained_weight, 1);
+    }
+
+    #[test]
+    fn shared_cache_rotates_token_shards_by_entry_count() {
+        let cache = SharedNodeCache::default();
+        for index in 0..=TOKEN_CAPACITY_PER_SHARD {
+            cache.token(index as u64, SyntaxKind(1), &index.to_string(), 1);
+        }
+
+        let shard = cache.tokens[0].lock().unwrap();
+        assert_eq!(shard.entries.len(), 1);
+        assert_eq!(shard.retained_weight, 1);
+    }
+
+    #[test]
     fn shared_cache_is_empty_after_quiescent_clear() {
         let cache = SharedNodeCache::default();
         cache.node(0, SyntaxKind(1), &mut Vec::new(), 0, 1);
@@ -751,21 +836,43 @@ mod tests {
     #[test]
     fn shared_cache_clear_is_safe_while_building() {
         let cache = Arc::new(SharedNodeCache::default());
+        let start = Arc::new(Barrier::new(5));
+        let active_builders = Arc::new(AtomicUsize::new(0));
+        let completed_builds = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
         let clearer = {
             let cache = Arc::clone(&cache);
+            let start = Arc::clone(&start);
+            let active_builders = Arc::clone(&active_builders);
+            let completed_builds = Arc::clone(&completed_builds);
+            let stop = Arc::clone(&stop);
             thread::spawn(move || {
+                start.wait();
+                while completed_builds.load(Ordering::Acquire) < 4 {
+                    thread::yield_now();
+                }
                 for _ in 0..100 {
                     cache.clear();
+                    assert_eq!(active_builders.load(Ordering::Acquire), 4);
                 }
+                stop.store(true, Ordering::Release);
             })
         };
         let builders: Vec<_> = (0..4)
             .map(|_| {
                 let cache = Arc::clone(&cache);
+                let start = Arc::clone(&start);
+                let active_builders = Arc::clone(&active_builders);
+                let completed_builds = Arc::clone(&completed_builds);
+                let stop = Arc::clone(&stop);
                 thread::spawn(move || {
-                    for _ in 0..100 {
+                    active_builders.fetch_add(1, Ordering::Release);
+                    start.wait();
+                    while !stop.load(Ordering::Acquire) {
                         assert_eq!(build(&cache).to_string(), "one");
+                        completed_builds.fetch_add(1, Ordering::Release);
                     }
+                    active_builders.fetch_sub(1, Ordering::Release);
                 })
             })
             .collect();
