@@ -43,16 +43,19 @@ struct Hashed<T> {
 }
 
 #[derive(Debug)]
-enum SharedElement {
-    Local,
-    Shareable { retained_weight: u32 },
+pub(super) struct CachedElement {
+    hash: u64,
+    interned: bool,
+    shareable: bool,
+    retained_weight: u32,
+    pub(super) green: GreenElement,
 }
 
 #[derive(Debug)]
-pub(super) struct SharedCache<'cache> {
+pub(super) struct SharedCacheBackend<'cache> {
     local: NodeCache,
     shared: &'cache SharedNodeCache,
-    elements: Vec<SharedElement>,
+    children: Vec<CachedElement>,
 }
 
 /// Interner for GreenTokens and GreenNodes
@@ -88,20 +91,17 @@ const TOKEN_RETAINED_WEIGHT_PER_SHARD: u32 = 64 * 1024;
 const MAX_SHARED_NODE_CHILDREN: usize = 1;
 const MAX_SHARED_TOKEN_LEN: usize = 8;
 const MAX_SHARED_SUBTREE_WEIGHT: u32 = 1024;
-// Keep shard bits above the low bits used to address our largest
-// hashbrown table, and below hashbrown's high-bit h2 fingerprint.
-const SHARD_SHIFT: u32 = 16;
 const SHARD_BITS: u32 = SHARD_COUNT.trailing_zeros();
+// Select from the high end of the hash while leaving hashbrown's top seven h2 bits intact.
+const SHARD_SHIFT: u32 = u64::BITS - 7 - SHARD_BITS;
 const _: () = {
     assert!(SHARD_COUNT.is_power_of_two());
-    assert!(NODE_CAPACITY_PER_SHARD < 1usize << SHARD_SHIFT);
-    assert!(TOKEN_CAPACITY_PER_SHARD < 1usize << SHARD_SHIFT);
-    assert!(SHARD_SHIFT + SHARD_BITS <= usize::BITS - 7);
+    assert!(SHARD_SHIFT + SHARD_BITS <= u64::BITS - 7);
 };
 
 /// An opt-in, bounded interner for sharing immutable green descendants across builders.
 ///
-/// Use this cache with [`crate::SharedGreenNodeBuilder`]. Ordinary builders and
+/// Use this cache with [`crate::GreenNodeBuilder::with_shared_cache`]. Ordinary builders and
 /// [`NodeCache`] retain their local-only behavior. Finished trees have distinct root allocations,
 /// while eligible descendants may be shared.
 ///
@@ -126,7 +126,10 @@ impl Default for SharedNodeCache {
 }
 
 fn token_hash(token: &GreenTokenData) -> u64 {
-    token_hash_parts(token.kind(), token.text())
+    let mut h = FxHasher::default();
+    token.kind().hash(&mut h);
+    token.text().hash(&mut h);
+    h.finish()
 }
 
 fn token_hash_parts(kind: SyntaxKind, text: &str) -> u64 {
@@ -141,35 +144,30 @@ fn node_hash(node: &GreenNodeData) -> u64 {
     node.kind().hash(&mut h);
     for child in node.children() {
         match child {
-            NodeOrToken::Node(node) => node_hash(node),
-            NodeOrToken::Token(token) => token_hash(token),
+            NodeOrToken::Node(it) => node_hash(it),
+            NodeOrToken::Token(it) => token_hash(it),
         }
-        .hash(&mut h);
+        .hash(&mut h)
     }
     h.finish()
 }
 
-fn cached_node_hash(kind: SyntaxKind, children: &[(u64, GreenElement)]) -> Option<u64> {
+fn cached_node_hash(kind: SyntaxKind, children: &[CachedElement]) -> u64 {
     let mut h = FxHasher::default();
     kind.hash(&mut h);
     for child in children {
-        if child.0 == 0 {
-            return None;
-        }
-        child.0.hash(&mut h);
+        child.hash.hash(&mut h);
     }
-    Some(h.finish())
+    h.finish()
 }
 
-fn node_weight(child_count: usize, elements: &[SharedElement]) -> Option<u32> {
+fn node_weight(children: &[CachedElement]) -> Option<u32> {
+    let child_count = children.len();
     let node = node::allocation_size(child_count)
         .saturating_add(cache_entry_size::<GreenNode>())
         .min(u32::MAX as usize) as u32;
-    elements.iter().try_fold(node, |weight, element| match element {
-        SharedElement::Local => None,
-        SharedElement::Shareable { retained_weight } => {
-            Some(weight.saturating_add(*retained_weight))
-        }
+    children.iter().try_fold(node, |weight, element| {
+        element.shareable.then(|| weight.saturating_add(element.retained_weight))
     })
 }
 
@@ -187,8 +185,8 @@ fn cache_entry_size<T>() -> usize {
     mem::size_of::<(Hashed<T>, ())>().saturating_add(1)
 }
 
-fn element_id(element: GreenElementRef<'_>) -> *const () {
-    match element {
+fn element_id(elem: GreenElementRef<'_>) -> *const () {
+    match elem {
         NodeOrToken::Node(it) => it as *const GreenNodeData as *const (),
         NodeOrToken::Token(it) => it as *const GreenTokenData as *const (),
     }
@@ -226,7 +224,7 @@ impl SharedNodeCache {
         &self,
         hash: u64,
         kind: SyntaxKind,
-        children: &mut Vec<(u64, GreenElement)>,
+        children: &mut Vec<CachedElement>,
         first_child: usize,
         retained_weight: u32,
     ) -> GreenNode {
@@ -249,7 +247,7 @@ impl SharedNodeCache {
                 > NODE_RETAINED_WEIGHT_PER_SHARD)
             .then(|| mem::take(&mut *shard));
         shard.retained_weight = shard.retained_weight.saturating_add(retained_weight);
-        let node = GreenNode::new(kind, children.drain(first_child..).map(|child| child.1));
+        let node = GreenNode::new(kind, children.drain(first_child..).map(|child| child.green));
         let entry = match shard.entries.raw_entry_mut().from_hash(hash, |_| false) {
             RawEntryMut::Vacant(entry) => entry,
             RawEntryMut::Occupied(_) => unreachable!(),
@@ -288,15 +286,14 @@ impl SharedNodeCache {
     }
 }
 
-fn node_matches(node: &GreenNodeData, kind: SyntaxKind, children: &[(u64, GreenElement)]) -> bool {
+fn node_matches(node: &GreenNodeData, kind: SyntaxKind, children: &[CachedElement]) -> bool {
     node.kind() == kind
         && node.children().len() == children.len()
         && node.children().zip(children).all(|(left, right)| {
-            let right = &right.1;
-            if element_id(left) == element_id(right.as_deref()) {
+            if element_id(left) == element_id(right.green.as_deref()) {
                 return true;
             }
-            match (left, right.as_deref()) {
+            match (left, right.green.as_deref()) {
                 (NodeOrToken::Node(left), NodeOrToken::Node(right)) => left == right,
                 (NodeOrToken::Token(left), NodeOrToken::Token(right)) => left == right,
                 _ => false,
@@ -305,6 +302,7 @@ fn node_matches(node: &GreenNodeData, kind: SyntaxKind, children: &[(u64, GreenE
 }
 
 impl NodeCache {
+    #[inline]
     pub(crate) fn node(
         &mut self,
         kind: SyntaxKind,
@@ -341,6 +339,7 @@ impl NodeCache {
         // For example, all `#[inline]` in this file share the same green node!
         // For `libsyntax/parse/parser.rs`, measurements show that deduping saves
         // 17% of the memory for green nodes!
+
         let entry = self.nodes.raw_entry_mut().from_hash(hash, |node| {
             node.0.kind() == kind && node.0.children().len() == children_ref.len() && {
                 let lhs = node.0.children();
@@ -368,7 +367,93 @@ impl NodeCache {
         (hash, node)
     }
 
+    #[inline]
     pub(crate) fn token(&mut self, kind: SyntaxKind, text: &str) -> (u64, GreenToken) {
+        let hash = {
+            let mut h = FxHasher::default();
+            kind.hash(&mut h);
+            text.hash(&mut h);
+            h.finish()
+        };
+
+        let entry = self
+            .tokens
+            .raw_entry_mut()
+            .from_hash(hash, |token| token.0.kind() == kind && token.0.text() == text);
+        let token = match entry {
+            RawEntryMut::Occupied(entry) => entry.key().0.clone(),
+            RawEntryMut::Vacant(entry) => {
+                let token = GreenToken::new(kind, text);
+                entry.insert_with_hasher(hash, NoHash(token.clone()), (), |t| token_hash(&t.0));
+                token
+            }
+        };
+
+        (hash, token)
+    }
+
+    fn shared_node(
+        &mut self,
+        kind: SyntaxKind,
+        children: &mut Vec<CachedElement>,
+        first_child: usize,
+    ) -> CachedElement {
+        let build_node = move |children: &mut Vec<CachedElement>| {
+            GreenNode::new(kind, children.drain(first_child..).map(|child| child.green))
+        };
+
+        let children_ref = &children[first_child..];
+        if children_ref.len() > 3 {
+            let node = build_node(children);
+            return CachedElement::local(0, false, node.into());
+        }
+
+        let mut h = FxHasher::default();
+        kind.hash(&mut h);
+        for child in children_ref {
+            if !child.interned {
+                let node = build_node(children);
+                return CachedElement::local(0, false, node.into());
+            }
+            child.hash.hash(&mut h);
+        }
+        let hash = h.finish();
+
+        // Green nodes are fully immutable, so it's ok to deduplicate them.
+        // This is the same optimization that Roslyn does
+        // https://github.com/KirillOsenkov/Bliki/wiki/Roslyn-Immutable-Trees
+        //
+        // For example, all `#[inline]` in this file share the same green node!
+        // For `libsyntax/parse/parser.rs`, measurements show that deduping saves
+        // 17% of the memory for green nodes!
+        let entry = self.nodes.raw_entry_mut().from_hash(hash, |node| {
+            node.0.kind() == kind && node.0.children().len() == children_ref.len() && {
+                let lhs = node.0.children();
+                let rhs = children_ref.iter().map(|child| child.green.as_deref());
+
+                let lhs = lhs.map(element_id);
+                let rhs = rhs.map(element_id);
+
+                lhs.eq(rhs)
+            }
+        });
+
+        let node = match entry {
+            RawEntryMut::Occupied(entry) => {
+                drop(children.drain(first_child..));
+                entry.key().0.clone()
+            }
+            RawEntryMut::Vacant(entry) => {
+                let node = build_node(children);
+                entry.insert_with_hasher(hash, NoHash(node.clone()), (), |n| node_hash(&n.0));
+                node
+            }
+        };
+
+        CachedElement::local(hash, true, node.into())
+    }
+
+    fn shared_token(&mut self, kind: SyntaxKind, text: &str) -> CachedElement {
         let hash = {
             let mut h = FxHasher::default();
             kind.hash(&mut h);
@@ -390,79 +475,98 @@ impl NodeCache {
             }
         };
 
-        (hash, token)
+        CachedElement::local(hash, true, token.into())
     }
 }
 
-impl<'cache> SharedCache<'cache> {
-    pub(super) fn new(shared: &'cache SharedNodeCache) -> Self {
-        SharedCache { local: NodeCache::default(), shared, elements: Vec::new() }
+impl CachedElement {
+    fn local(hash: u64, interned: bool, green: GreenElement) -> Self {
+        CachedElement { hash, interned, shareable: false, retained_weight: 0, green }
+    }
+}
+
+impl<'cache> SharedCacheBackend<'cache> {
+    pub(super) fn new(cache: &'cache SharedNodeCache) -> Self {
+        SharedCacheBackend { local: NodeCache::default(), shared: cache, children: Vec::new() }
     }
 
-    pub(super) fn finish(self, root: GreenNode) -> GreenNode {
-        match self.elements.as_slice() {
-            [SharedElement::Local] => root,
-            [SharedElement::Shareable { .. }] => {
-                GreenNode::new(root.kind(), root.children().map(|child| child.to_owned()))
-            }
-            _ => unreachable!(),
-        }
+    pub(super) fn len(&self) -> usize {
+        self.children.len()
     }
 
-    #[inline]
-    pub(super) fn node(
-        &mut self,
-        kind: SyntaxKind,
-        children: &mut Vec<(u64, GreenElement)>,
-        first_child: usize,
-    ) -> (u64, GreenNode) {
-        let children_ref = &children[first_child..];
+    // Keep shared-only policy out of the ordinary builder's inlined hot path.
+    #[inline(never)]
+    pub(super) fn node(&mut self, kind: SyntaxKind, first_child: usize) {
+        let children_ref = &self.children[first_child..];
         if children_ref.len() <= MAX_SHARED_NODE_CHILDREN {
-            if let Some(retained_weight) =
-                node_weight(children_ref.len(), &self.elements[first_child..])
-            {
+            if let Some(retained_weight) = node_weight(children_ref) {
                 if retained_weight <= MAX_SHARED_SUBTREE_WEIGHT {
-                    if let Some(hash) = cached_node_hash(kind, children_ref) {
-                        let node =
-                            self.shared.node(hash, kind, children, first_child, retained_weight);
-                        self.elements.truncate(first_child);
-                        self.elements.push(SharedElement::Shareable { retained_weight });
-                        return (hash, node);
-                    }
+                    let hash = cached_node_hash(kind, children_ref);
+                    let node = self.shared.node(
+                        hash,
+                        kind,
+                        &mut self.children,
+                        first_child,
+                        retained_weight,
+                    );
+                    self.children.push(CachedElement {
+                        hash,
+                        interned: true,
+                        shareable: true,
+                        retained_weight,
+                        green: node.into(),
+                    });
+                    return;
                 }
             }
         }
 
-        let node = self.local.node(kind, children, first_child);
-        self.elements.truncate(first_child);
-        self.elements.push(SharedElement::Local);
-        node
+        let node = self.local.shared_node(kind, &mut self.children, first_child);
+        self.children.push(node);
     }
 
-    #[inline]
-    pub(super) fn token(&mut self, kind: SyntaxKind, text: &str) -> (u64, GreenToken) {
-        let retained_weight = token_weight(text);
+    #[inline(never)]
+    pub(super) fn token(&mut self, kind: SyntaxKind, text: &str) {
         if text.len() <= MAX_SHARED_TOKEN_LEN {
             let hash = token_hash_parts(kind, text);
+            let retained_weight = token_weight(text);
             let token = self.shared.token(hash, kind, text, retained_weight);
-            self.elements.push(SharedElement::Shareable { retained_weight });
-            return (hash, token);
+            self.children.push(CachedElement {
+                hash,
+                interned: true,
+                shareable: true,
+                retained_weight,
+                green: token.into(),
+            });
+        } else {
+            self.children.push(self.local.shared_token(kind, text));
         }
+    }
 
-        let token = self.local.token(kind, text);
-        self.elements.push(SharedElement::Local);
-        token
+    pub(super) fn finish(mut self) -> GreenNode {
+        assert_eq!(self.children.len(), 1);
+        let root = self.children.pop().unwrap();
+        let shareable = root.shareable;
+        let node = match root.green {
+            NodeOrToken::Node(node) => node,
+            NodeOrToken::Token(_) => panic!(),
+        };
+        if shareable {
+            GreenNode::new(node.kind(), node.children().map(|child| child.to_owned()))
+        } else {
+            node
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SharedGreenNodeBuilder;
+    use crate::GreenNodeBuilder;
     use std::{sync::Arc, thread};
 
     fn build(cache: &SharedNodeCache) -> GreenNode {
-        let mut builder = SharedGreenNodeBuilder::new(cache);
+        let mut builder = GreenNodeBuilder::with_shared_cache(cache);
         builder.start_node(SyntaxKind(0));
         builder.token(SyntaxKind(1), "one");
         builder.finish_node();
@@ -470,14 +574,17 @@ mod tests {
     }
 
     #[test]
-    fn local_cache_returns_hashes_separately_from_values() {
+    fn local_cache_tracks_hashes_without_changing_map_entry_layout() {
         let mut cache = NodeCache::default();
-        let (hash, token): (u64, GreenToken) = cache.token(SyntaxKind(1), "one");
-        let mut children = vec![(hash, token.into())];
-        let (_, _node): (u64, GreenNode) = cache.node(SyntaxKind(0), &mut children, 0);
+        let token = cache.shared_token(SyntaxKind(1), "one");
+        let mut children = vec![token];
+        let node = cache.shared_node(SyntaxKind(0), &mut children, 0);
 
+        assert!(node.interned);
         assert_eq!(mem::size_of::<NoHash<GreenNode>>(), mem::size_of::<GreenNode>());
         assert_eq!(mem::size_of::<NoHash<GreenToken>>(), mem::size_of::<GreenToken>());
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(mem::size_of::<CachedElement>(), 32);
     }
 
     #[test]
@@ -488,32 +595,22 @@ mod tests {
     #[test]
     fn retained_weights_include_allocation_and_cache_entry_storage() {
         assert!(token_weight_for_len(0) > mem::size_of::<GreenToken>() as u32);
-        assert!(node_weight(0, &[]).unwrap() > mem::size_of::<GreenNode>() as u32);
-    }
-
-    #[test]
-    fn node_hash_requires_cached_child_hashes() {
-        let child = (0, GreenToken::new(SyntaxKind(1), "one").into());
-
-        assert_eq!(cached_node_hash(SyntaxKind(0), &[child]), None);
+        assert!(node_weight(&[]).unwrap() > mem::size_of::<GreenNode>() as u32);
     }
 
     #[test]
     fn shared_fallback_does_not_mark_uncached_nodes_canonical() {
         let cache = SharedNodeCache::default();
-        let mut shared = SharedCache::new(&cache);
-        let mut children = Vec::new();
+        let mut shared = SharedCacheBackend::new(&cache);
         for kind in 0..4 {
-            let (hash, token) = shared.token(SyntaxKind(kind), "x");
-            children.push((hash, token.into()));
+            shared.token(SyntaxKind(kind), "x");
         }
 
-        let (wide_hash, wide) = shared.node(SyntaxKind(4), &mut children, 0);
-        assert_eq!(wide_hash, 0);
-        children.push((wide_hash, wide.into()));
+        shared.node(SyntaxKind(4), 0);
+        assert!(!shared.children[0].shareable);
 
-        let (parent_hash, _) = shared.node(SyntaxKind(5), &mut children, 0);
-        assert_eq!(parent_hash, 0);
+        shared.node(SyntaxKind(5), 0);
+        assert!(!shared.children[0].shareable);
     }
 
     #[test]
@@ -521,13 +618,10 @@ mod tests {
         let cache = SharedNodeCache::default();
         let root = GreenNode::new(SyntaxKind(0), std::iter::empty());
         let original = root.clone();
-        let shared = SharedCache {
-            local: NodeCache::default(),
-            shared: &cache,
-            elements: vec![SharedElement::Local],
-        };
+        let mut shared = SharedCacheBackend::new(&cache);
+        shared.children.push(CachedElement::local(0, false, root.into()));
 
-        let finished = shared.finish(root);
+        let finished = shared.finish();
 
         assert!(std::ptr::eq::<GreenNodeData>(&*original, &*finished));
     }
@@ -602,20 +696,20 @@ mod tests {
     }
 
     #[test]
-    fn shard_index_uses_middle_hash_bits() {
-        assert_ne!(shard_index(0), shard_index(1 << 16));
+    fn shard_index_uses_high_hash_bits_below_the_fingerprint() {
+        assert_ne!(shard_index(0), shard_index(1 << 49));
     }
 
     #[test]
     fn shard_index_ignores_hashbrown_fingerprint_bits() {
-        let middle = 0x5a << 16;
+        let middle = 0x5a << 49;
 
         assert_eq!(shard_index(middle), shard_index(middle | (0xfe << 56)));
     }
 
     #[test]
     fn shard_index_ignores_low_bucket_bits() {
-        assert_eq!(shard_index(0), shard_index(0xffff));
+        assert_eq!(shard_index(0), shard_index((1 << 49) - 1));
     }
 
     #[test]
