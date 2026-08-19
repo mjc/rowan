@@ -281,14 +281,11 @@ impl NodeData {
     }
 
     fn next_sibling_or_token(&self) -> Option<SyntaxElement> {
-        let mut siblings = self.green_siblings().enumerate();
         let index = self.index() as usize + 1;
-
-        siblings.nth(index).and_then(|(index, child)| {
-            let parent = self.parent_node()?;
-            let offset = parent.offset() + child.rel_offset();
-            Some(SyntaxElement::new(child.as_ref(), parent, index as u32, offset))
-        })
+        let child = self.green_siblings().nth(index)?;
+        let parent = self.parent_node()?;
+        let offset = self.offset() + self.green().text_len();
+        Some(SyntaxElement::new(child.as_ref(), parent, index as u32, offset))
     }
     fn prev_sibling_or_token(&self) -> Option<SyntaxElement> {
         let mut siblings = self.green_siblings().enumerate();
@@ -428,9 +425,11 @@ impl SyntaxNode {
     }
 
     pub fn first_child_or_token(&self) -> Option<SyntaxElement> {
-        self.green_ref().children().raw.next().map(|child| {
-            SyntaxElement::new(child.as_ref(), self.clone(), 0, self.offset() + child.rel_offset())
-        })
+        self.green_ref()
+            .children()
+            .raw
+            .next()
+            .map(|child| SyntaxElement::new(child.as_ref(), self.clone(), 0, self.offset()))
     }
     pub fn last_child_or_token(&self) -> Option<SyntaxElement> {
         self.green_ref().children().raw.enumerate().next_back().map(|(index, child)| {
@@ -1026,7 +1025,7 @@ impl Iterator for PreorderWithTokens {
 mod tests {
     use std::{collections::hash_map::DefaultHasher, hash::Hash as _, hash::Hasher as _};
 
-    use crate::{GreenNode, GreenToken, SyntaxKind};
+    use crate::{GreenNode, GreenToken, SyntaxKind, TextRange, WalkEvent};
 
     use super::SyntaxNode;
 
@@ -1057,6 +1056,36 @@ mod tests {
 
         assert_ne!(original, cloned);
         assert_ne!(original.first_token(), cloned.first_token());
+    }
+
+    #[test]
+    fn preorder_with_tokens_preserves_adjacent_offsets() {
+        let kind = SyntaxKind(0);
+        let nested = GreenNode::new(kind, [GreenToken::new(kind, "bc").into()]);
+        let green = GreenNode::new(
+            kind,
+            [
+                GreenToken::new(kind, "a").into(),
+                nested.into(),
+                GreenToken::new(kind, "").into(),
+                GreenToken::new(kind, "d").into(),
+            ],
+        );
+        let root = SyntaxNode::new_root(green);
+
+        let ranges: Vec<_> = root
+            .preorder_with_tokens()
+            .filter_map(|event| match event {
+                WalkEvent::Enter(element) => Some(element.text_range()),
+                WalkEvent::Leave(_) => None,
+            })
+            .collect();
+
+        let range = |start: u32, end: u32| TextRange::new(start.into(), end.into());
+        assert_eq!(
+            ranges,
+            [range(0, 4), range(0, 1), range(1, 3), range(1, 3), range(3, 3), range(3, 4),]
+        );
     }
 }
 // endregion
