@@ -241,6 +241,32 @@ mod tests {
     }
 
     #[test]
+    fn shared_cache_supports_checkpoint_wrapping() {
+        fn build(cache: &SharedNodeCache) -> GreenNode {
+            let mut builder = SharedGreenNodeBuilder::new(cache);
+            builder.start_node(SyntaxKind(0));
+            let checkpoint = builder.checkpoint();
+            builder.token(SyntaxKind(1), "one");
+            builder.start_node_at(checkpoint, SyntaxKind(2));
+            builder.finish_node();
+            builder.token(SyntaxKind(1), "two");
+            builder.finish_node();
+            builder.finish()
+        }
+
+        let cache = SharedNodeCache::default();
+        let first = build(&cache);
+        let second = build(&cache);
+
+        assert_eq!(first.to_string(), "onetwo");
+        assert_eq!(first, second);
+        assert!(std::ptr::eq::<crate::GreenNodeData>(
+            first.children().next().unwrap().into_node().unwrap(),
+            second.children().next().unwrap().into_node().unwrap(),
+        ));
+    }
+
+    #[test]
     fn shared_cache_does_not_share_long_tokens_through_unary_nodes() {
         fn build(cache: &SharedNodeCache) -> GreenNode {
             let mut builder = SharedGreenNodeBuilder::new(cache);

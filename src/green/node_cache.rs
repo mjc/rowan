@@ -519,9 +519,11 @@ mod tests {
         let first = cache.node(0, SyntaxKind(1), &mut children, 0, 1);
         let second = cache.node(0, SyntaxKind(2), &mut children, 0, 1);
         let repeated = cache.node(0, SyntaxKind(2), &mut children, 0, 1);
+        let first_repeated = cache.node(0, SyntaxKind(1), &mut children, 0, 1);
 
         assert!(!std::ptr::eq::<GreenNodeData>(&*first, &*second));
         assert!(std::ptr::eq::<GreenNodeData>(&*second, &*repeated));
+        assert!(std::ptr::eq::<GreenNodeData>(&*first, &*first_repeated));
     }
 
     #[test]
@@ -602,9 +604,11 @@ mod tests {
         let first = cache.token(0, SyntaxKind(1), "one", 1);
         let second = cache.token(0, SyntaxKind(1), "two", 1);
         let repeated = cache.token(0, SyntaxKind(1), "two", 1);
+        let first_repeated = cache.token(0, SyntaxKind(1), "one", 1);
 
         assert!(!std::ptr::eq(&*first, &*second));
         assert!(std::ptr::eq(&*second, &*repeated));
+        assert!(std::ptr::eq(&*first, &*first_repeated));
     }
 
     #[test]

@@ -321,6 +321,10 @@ impl SyntaxNode {
         SyntaxNode { ptr: NodeData::new(Some(parent), index, offset, green) }
     }
 
+    /// Returns an independent red-tree root for this subtree.
+    ///
+    /// The green contents remain structurally equal, but the returned node and its descendants have
+    /// a distinct syntax identity from the source tree.
     pub fn clone_subtree(&self) -> SyntaxNode {
         let green = self.green();
         let root = GreenNode::new(green.kind(), green.children().map(|child| child.to_owned()));
