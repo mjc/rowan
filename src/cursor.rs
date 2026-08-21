@@ -182,6 +182,30 @@ impl NodeData {
     }
 
     #[inline]
+    fn has_same_identity(&self, other: &NodeData) -> bool {
+        self.key() == other.key() && self.root() == other.root()
+    }
+
+    #[inline]
+    fn root(&self) -> ptr::NonNull<GreenNodeData> {
+        let mut root = self;
+        while let Some(parent) = root.parent() {
+            root = parent;
+        }
+        match &root.green {
+            Green::Node { ptr } => *ptr,
+            Green::Token { .. } => unreachable!("a token cannot be a root"),
+        }
+    }
+
+    #[inline]
+    fn hash_key<H: Hasher>(&self, state: &mut H) {
+        // The root only disambiguates otherwise-equal green keys; it is not needed by Hash's
+        // equal-values-must-match contract.
+        self.key().hash(state);
+    }
+
+    #[inline]
     fn parent_node(&self) -> Option<SyntaxNode> {
         let parent = self.parent()?;
         debug_assert!(matches!(parent.green, Green::Node { .. }));
@@ -262,14 +286,11 @@ impl NodeData {
     }
 
     fn next_sibling_or_token(&self) -> Option<SyntaxElement> {
-        let mut siblings = self.green_siblings().enumerate();
         let index = self.index() as usize + 1;
-
-        siblings.nth(index).and_then(|(index, child)| {
-            let parent = self.parent_node()?;
-            let offset = parent.offset() + child.rel_offset();
-            Some(SyntaxElement::new(child.as_ref(), parent, index as u32, offset))
-        })
+        let child = self.green_siblings().nth(index)?;
+        let parent = self.parent_node()?;
+        let offset = self.offset() + self.green().text_len();
+        Some(SyntaxElement::new(child.as_ref(), parent, index as u32, offset))
     }
     fn prev_sibling_or_token(&self) -> Option<SyntaxElement> {
         let mut siblings = self.green_siblings().enumerate();
@@ -300,8 +321,14 @@ impl SyntaxNode {
         SyntaxNode { ptr: NodeData::new(Some(parent), index, offset, green) }
     }
 
+    /// Returns an independent red-tree root for this subtree.
+    ///
+    /// The green contents remain structurally equal, but the returned node and its descendants have
+    /// a distinct syntax identity from the source tree.
     pub fn clone_subtree(&self) -> SyntaxNode {
-        SyntaxNode::new_root(self.green().to_owned())
+        let green = self.green();
+        let root = GreenNode::new(green.kind(), green.children().map(|child| child.to_owned()));
+        SyntaxNode::new_root(root)
     }
 
     #[inline]
@@ -407,9 +434,11 @@ impl SyntaxNode {
     }
 
     pub fn first_child_or_token(&self) -> Option<SyntaxElement> {
-        self.green_ref().children().raw.next().map(|child| {
-            SyntaxElement::new(child.as_ref(), self.clone(), 0, self.offset() + child.rel_offset())
-        })
+        self.green_ref()
+            .children()
+            .raw
+            .next()
+            .map(|child| SyntaxElement::new(child.as_ref(), self.clone(), 0, self.offset()))
     }
     pub fn last_child_or_token(&self) -> Option<SyntaxElement> {
         self.green_ref().children().raw.enumerate().next_back().map(|(index, child)| {
@@ -774,7 +803,7 @@ impl SyntaxElement {
 impl PartialEq for SyntaxNode {
     #[inline]
     fn eq(&self, other: &SyntaxNode) -> bool {
-        self.data().key() == other.data().key()
+        self.data().has_same_identity(other.data())
     }
 }
 
@@ -783,7 +812,7 @@ impl Eq for SyntaxNode {}
 impl Hash for SyntaxNode {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.data().key().hash(state);
+        self.data().hash_key(state);
     }
 }
 
@@ -811,7 +840,7 @@ impl fmt::Display for SyntaxNode {
 impl PartialEq for SyntaxToken {
     #[inline]
     fn eq(&self, other: &SyntaxToken) -> bool {
-        self.data().key() == other.data().key()
+        self.data().has_same_identity(other.data())
     }
 }
 
@@ -820,7 +849,7 @@ impl Eq for SyntaxToken {}
 impl Hash for SyntaxToken {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.data().key().hash(state);
+        self.data().hash_key(state);
     }
 }
 
@@ -998,6 +1027,93 @@ impl Iterator for PreorderWithTokens {
             })
         });
         next
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::hash_map::DefaultHasher, hash::Hash, hash::Hasher};
+
+    use crate::{GreenNode, GreenToken, SyntaxKind, TextRange, WalkEvent};
+
+    use super::{NodeData, SyntaxNode};
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn red_node_layout_stays_compact() {
+        assert_eq!(std::mem::size_of::<NodeData>(), 40);
+    }
+
+    fn hash(value: &impl Hash) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn repeated_root_reconstruction_preserves_syntax_identity() {
+        let kind = SyntaxKind(0);
+        let green = GreenNode::new(kind, [GreenToken::new(kind, "token").into()]);
+        let first = SyntaxNode::new_root(green.clone());
+        let second = SyntaxNode::new_root(green);
+
+        assert_eq!(first, second);
+        assert_eq!(first.first_token(), second.first_token());
+        assert_eq!(hash(&first), hash(&second));
+    }
+
+    #[test]
+    fn cloned_subtree_has_independent_syntax_identity() {
+        let kind = SyntaxKind(0);
+        let green = GreenNode::new(kind, [GreenToken::new(kind, "token").into()]);
+        let original = SyntaxNode::new_root(green);
+        let cloned = original.clone_subtree();
+
+        assert_ne!(original, cloned);
+        assert_ne!(original.first_token(), cloned.first_token());
+    }
+
+    #[test]
+    fn shared_descendants_hash_without_root_identity() {
+        let kind = SyntaxKind(0);
+        let token = GreenToken::new(kind, "token");
+        let first = SyntaxNode::new_root(GreenNode::new(kind, [token.clone().into()]));
+        let second = SyntaxNode::new_root(GreenNode::new(kind, [token.into()]));
+        let first_token = first.first_token().unwrap();
+        let second_token = second.first_token().unwrap();
+
+        assert_ne!(first_token, second_token);
+        assert_eq!(hash(&first_token), hash(&second_token));
+    }
+
+    #[test]
+    fn preorder_with_tokens_preserves_adjacent_offsets() {
+        let kind = SyntaxKind(0);
+        let nested = GreenNode::new(kind, [GreenToken::new(kind, "bc").into()]);
+        let green = GreenNode::new(
+            kind,
+            [
+                GreenToken::new(kind, "a").into(),
+                nested.into(),
+                GreenToken::new(kind, "").into(),
+                GreenToken::new(kind, "d").into(),
+            ],
+        );
+        let root = SyntaxNode::new_root(green);
+
+        let ranges: Vec<_> = root
+            .preorder_with_tokens()
+            .filter_map(|event| match event {
+                WalkEvent::Enter(element) => Some(element.text_range()),
+                WalkEvent::Leave(_) => None,
+            })
+            .collect();
+
+        let range = |start: u32, end: u32| TextRange::new(start.into(), end.into());
+        assert_eq!(
+            ranges,
+            [range(0, 4), range(0, 1), range(1, 3), range(1, 3), range(3, 3), range(3, 4),]
+        );
     }
 }
 // endregion

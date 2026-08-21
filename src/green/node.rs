@@ -9,7 +9,7 @@ use std::{
 use countme::Count;
 
 use crate::{
-    arc::{Arc, HeaderSlice, ThinArc},
+    arc::{Arc, ArcInner, HeaderSlice, ThinArc},
     green::{GreenElement, GreenElementRef, SyntaxKind},
     utility_types::static_assert,
     GreenToken, NodeOrToken, TextRange, TextSize,
@@ -32,6 +32,12 @@ static_assert!(mem::size_of::<GreenChild>() == mem::size_of::<usize>() * 2);
 
 type Repr = HeaderSlice<GreenNodeHead, [GreenChild]>;
 type ReprThin = HeaderSlice<GreenNodeHead, [GreenChild; 0]>;
+
+pub(super) fn allocation_size(child_count: usize) -> usize {
+    mem::size_of::<ArcInner<ReprThin>>()
+        .saturating_add(child_count.saturating_mul(mem::size_of::<GreenChild>()))
+}
+
 #[repr(transparent)]
 pub struct GreenNodeData {
     data: ReprThin,
