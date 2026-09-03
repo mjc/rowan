@@ -26,8 +26,9 @@ pub(crate) fn trim_memory() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "pool-allocator")]
+    use std::alloc::Layout;
     use std::{
-        alloc::Layout,
         collections::hash_map::DefaultHasher,
         hash::{Hash, Hasher},
     };
@@ -71,6 +72,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "pool-allocator")]
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn small_green_allocations_share_and_reuse_pool_pages() {
@@ -97,6 +99,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "pool-allocator")]
     #[test]
     fn small_green_allocations_do_not_cross_trim_chunks() {
         for size in (4..=256).step_by(4) {
@@ -119,6 +122,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "pool-allocator")]
     #[cfg(target_os = "linux")]
     #[test]
     fn small_green_allocations_trim_empty_chunks() {

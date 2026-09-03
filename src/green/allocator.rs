@@ -47,12 +47,18 @@ fn pools() -> &'static [Mutex<Pool>] {
     POOLS.get_or_init(|| (0..CLASS_COUNT).map(|_| Mutex::new(Pool::default())).collect())
 }
 
+#[cfg(feature = "pool-allocator")]
 fn class(layout: Layout) -> Option<(usize, usize)> {
     if layout.align() > ALIGN || layout.size() > MAX_POOLED_SIZE {
         return None;
     }
     let block_size = layout.size().max(ALIGN).next_multiple_of(ALIGN);
     Some((block_size / ALIGN - 1, block_size))
+}
+
+#[cfg(not(feature = "pool-allocator"))]
+fn class(_: Layout) -> Option<(usize, usize)> {
+    None
 }
 
 fn blocks_per_chunk(block_size: usize) -> usize {

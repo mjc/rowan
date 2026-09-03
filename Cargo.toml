@@ -27,4 +27,6 @@ serde = { version = "1.0.89", optional = true, default-features = false }
 m_lexer = "0.0.4"
 
 [features]
+default = ["pool-allocator"]
+pool-allocator = []
 serde1 = ["serde", "text-size/serde"]
